@@ -862,6 +862,7 @@ func updateMonitoringData(token TokenMonitoring) {
 	}
 }
 
+// Modified updateStatusAndLog function - only logs stop-loss related events
 func updateStatusAndLog(rowIndex int, status string, logMessage string, args ...interface{}) {
 	// Update Status (column C)
 	vrStatus := &sheets.ValueRange{Values: [][]interface{}{{status}}}
@@ -872,67 +873,221 @@ func updateStatusAndLog(rowIndex int, status string, logMessage string, args ...
 		log.Printf("⚠️ Failed to update status: %v", err)
 	}
 
-	// Append to Log (column Q)
+	// Only log stop-loss related events to column Q
 	fullLogMessage := fmt.Sprintf(logMessage, args...)
-	timestampedLog := fmt.Sprintf("[%s] %s\n",
-		time.Now().Format("2006-01-02 15:04:05"), fullLogMessage)
+	
+	// Check if this is a stop-loss related message
+	isStopLossEvent := strings.Contains(fullLogMessage, "TRAILING STOP-LOSS") ||
+					  strings.Contains(fullLogMessage, "STOP-LOSS TRIGGERED") ||
+					  strings.Contains(fullLogMessage, "STOP-LOSS ACTIVATED") ||
+					  strings.Contains(fullLogMessage, "ATH") ||
+					  strings.Contains(fullLogMessage, "MAJOR ATH")
+	
+	if isStopLossEvent {
+		timestampedLog := fmt.Sprintf("[%s] %s\n",
+			time.Now().Format("2006-01-02 15:04:05"), fullLogMessage)
 
-	// Get existing log
-	rangeStrLogGet := fmt.Sprintf("%s!Q%d", appConfig.SheetName, rowIndex)
-	resp, err := sheetsSvc.Spreadsheets.Values.Get(appConfig.SpreadsheetID, rangeStrLogGet).Do()
-	if err != nil {
-		log.Printf("⚠️ Failed to read existing log: %v", err)
-		return
+		// Get existing log
+		rangeStrLogGet := fmt.Sprintf("%s!Q%d", appConfig.SheetName, rowIndex)
+		resp, err := sheetsSvc.Spreadsheets.Values.Get(appConfig.SpreadsheetID, rangeStrLogGet).Do()
+		if err != nil {
+			log.Printf("⚠️ Failed to read existing log: %v", err)
+			return
+		}
+
+		existingLog := ""
+		if len(resp.Values) > 0 && len(resp.Values[0]) > 0 {
+			existingLog = fmt.Sprintf("%v", resp.Values[0][0])
+		}
+
+		newLog := existingLog + timestampedLog
+		vrLog := &sheets.ValueRange{Values: [][]interface{}{{newLog}}}
+		_, err = sheetsSvc.Spreadsheets.Values.Update(
+			appConfig.SpreadsheetID, rangeStrLogGet, vrLog).ValueInputOption("RAW").Do()
+		if err != nil {
+			log.Printf("⚠️ Failed to append log: %v", err)
+		}
 	}
 
-	existingLog := ""
-	if len(resp.Values) > 0 && len(resp.Values[0]) > 0 {
-		existingLog = fmt.Sprintf("%v", resp.Values[0][0])
+	// Always log stop-loss events to console
+	if isStopLossEvent {
+		log.Printf("📝 Row %d: %s", rowIndex, fullLogMessage)
 	}
-
-	newLog := existingLog + timestampedLog
-	vrLog := &sheets.ValueRange{Values: [][]interface{}{{newLog}}}
-	_, err = sheetsSvc.Spreadsheets.Values.Update(
-		appConfig.SpreadsheetID, rangeStrLogGet, vrLog).ValueInputOption("RAW").Do()
-	if err != nil {
-		log.Printf("⚠️ Failed to append log: %v", err)
-	}
-
-	// Also log to console
-	log.Printf("📝 Row %d: %s", rowIndex, fullLogMessage)
 }
 
-func logStopLossUpdate(rowIndex int, update StopLossUpdate) {
-	// Log stop-loss update to dedicated column (column P)
-	stopLossLogMessage := fmt.Sprintf("[%s] Stop-Loss: %.2fx → %.2fx (ATH: %.2fx) - %s\n",
-		update.Timestamp.Format("2006-01-02 15:04:05"),
-		update.OldMultiplier,
-		update.NewMultiplier,
-		update.ATHMultiplier,
-		update.Reason)
+// Modified monitorActiveToken function - Enhanced ATH and stop-loss logging
+func monitorActiveToken(token TokenMonitoring) {
+	log.Printf("👀 Monitoring: %s (%s) - Current: %.2fx", 
+		token.TokenName, token.TokenAddress[:8], token.CurrentMultiplier)
 
-	// Get existing stop-loss log
-	rangeStrStopLossGet := fmt.Sprintf("%s!P%d", appConfig.SheetName, rowIndex)
-	resp, err := sheetsSvc.Spreadsheets.Values.Get(appConfig.SpreadsheetID, rangeStrStopLossGet).Do()
+	// Get current price
+	price, err := getJupiterPrice(token.TokenAddress)
 	if err != nil {
-		log.Printf("⚠️ Failed to read existing stop-loss log: %v", err)
+		log.Printf("⚠️ Price fetch failed for %s: %v", token.TokenAddress, err)
 		return
 	}
 
-	existingStopLossLog := ""
-	if len(resp.Values) > 0 && len(resp.Values[0]) > 0 {
-		existingStopLossLog = fmt.Sprintf("%v", resp.Values[0][0])
-	}
-
-	newStopLossLog := existingStopLossLog + stopLossLogMessage
-	vrStopLossLog := &sheets.ValueRange{Values: [][]interface{}{{newStopLossLog}}}
-	_, err = sheetsSvc.Spreadsheets.Values.Update(
-		appConfig.SpreadsheetID, rangeStrStopLossGet, vrStopLossLog).ValueInputOption("RAW").Do()
+	// Get current market cap
+	_, currentMarketCap, err := getTokenMetadata(token.TokenAddress)
 	if err != nil {
-		log.Printf("⚠️ Failed to append stop-loss log: %v", err)
+		log.Printf("⚠️ Market cap fetch failed for %s: %v", token.TokenAddress, err)
+		currentMarketCap = token.CurrentMarketCap // Keep previous value
 	}
 
-	// Also log to console with special formatting.
-	log.Printf("🛡️ STOP-LOSS UPDATE Row %d: %.2fx → %.2fx (ATH: %.2fx) - %s", 
-		rowIndex, update.OldMultiplier, update.NewMultiplier, update.ATHMultiplier, update.Reason)
+	// Track price direction
+	previousPrice := token.CurrentPrice
+	priceDirection := "STABLE"
+	if price > previousPrice {
+		priceDirection = "UP"
+		token.ConsecutiveDownticks = 0
+	} else if price < previousPrice {
+		priceDirection = "DOWN"
+		if token.LastPriceDirection == "DOWN" {
+			token.ConsecutiveDownticks++
+		} else {
+			token.ConsecutiveDownticks = 1
+		}
+	}
+	token.LastPriceDirection = priceDirection
+
+	// Update position
+	token.CurrentPrice = price
+	token.CurrentMarketCap = currentMarketCap
+	token.LastUpdated = time.Now()
+
+	// Calculate current multiplier from start price
+	if token.MonitorStartPrice > 0 {
+		token.CurrentMultiplier = token.CurrentPrice / token.MonitorStartPrice
+	}
+
+	// Update highest price and market cap
+	if token.CurrentPrice > token.HighestPrice {
+		token.HighestPrice = token.CurrentPrice
+		token.HighestMarketCap = currentMarketCap
+		token.HighestMultiplier = token.CurrentMultiplier
+
+		// Enhanced ATH logging with stop-loss context
+		if token.HighestMultiplier >= 10.0 {
+			updateStatusAndLog(token.RowIndex, "MONITORING",
+				"🚀 MAJOR ATH! %s | %.1fx | Price: $%.8f | MC: $%.0f | Will protect at: %.1fx when pullback begins",
+				token.TokenName, token.HighestMultiplier, token.CurrentPrice, token.HighestMarketCap, token.HighestMultiplier*0.83)
+		} else if token.HighestMultiplier >= 2.0 {
+			_, potentialStopMultiplier := calculateTrailingStopLoss(token)
+			updateStatusAndLog(token.RowIndex, "MONITORING",
+				"🔥 NEW ATH! %s | %.2fx | Price: $%.8f | MC: $%.0f | Protected at: %.2fx",
+				token.TokenName, token.HighestMultiplier, token.CurrentPrice, token.HighestMarketCap, potentialStopMultiplier)
+		}
+	}
+
+	// Calculate and update trailing stop-loss
+	newStopLoss, newStopMultiplier := calculateTrailingStopLoss(token)
+
+	// Track stop-loss updates with enhanced logging
+	if newStopLoss > token.TrailingStopLoss && token.TrailingStopLoss > 0 {
+		// Stop-loss was raised
+		stopLossUpdate := StopLossUpdate{
+			Timestamp:     time.Now(),
+			OldStopLoss:   token.TrailingStopLoss,
+			NewStopLoss:   newStopLoss,
+			OldMultiplier: token.StopLossMultiplier,
+			NewMultiplier: newStopMultiplier,
+			ATHMultiplier: token.HighestMultiplier,
+			Reason:        fmt.Sprintf("ATH reached %.2fx", token.HighestMultiplier),
+		}
+		token.StopLossHistory = append(token.StopLossHistory, stopLossUpdate)
+
+		updateStatusAndLog(token.RowIndex, "MONITORING",
+			"📈 TRAILING STOP-LOSS RAISED: %s | %.2fx → %.2fx | Peak: %.2fx | Protecting: +%.0f%% profit",
+			token.TokenName, token.StopLossMultiplier, newStopMultiplier, token.HighestMultiplier, (newStopMultiplier-1)*100)
+
+		// Log detailed stop-loss update
+		logStopLossUpdate(token.RowIndex, stopLossUpdate)
+
+	} else if newStopLoss > 0 && token.TrailingStopLoss == 0 {
+		// Stop-loss activated for first time
+		stopLossUpdate := StopLossUpdate{
+			Timestamp:     time.Now(),
+			OldStopLoss:   0,
+			NewStopLoss:   newStopLoss,
+			OldMultiplier: 0,
+			NewMultiplier: newStopMultiplier,
+			ATHMultiplier: token.HighestMultiplier,
+			Reason:        "Stop-loss activated at 2x",
+		}
+		token.StopLossHistory = append(token.StopLossHistory, stopLossUpdate)
+
+		updateStatusAndLog(token.RowIndex, "MONITORING",
+			"✅ TRAILING STOP-LOSS ACTIVATED! %s | Protected at %.2fx | Peak reached: %.2fx | Securing: +%.0f%% profit",
+			token.TokenName, newStopMultiplier, token.HighestMultiplier, (newStopMultiplier-1)*100)
+
+		logStopLossUpdate(token.RowIndex, stopLossUpdate)
+	}
+
+	token.TrailingStopLoss = newStopLoss
+	token.StopLossMultiplier = newStopMultiplier
+
+	// Enhanced stop-loss trigger logging
+	if token.TrailingStopLoss > 0 && token.CurrentPrice <= token.TrailingStopLoss {
+		percentDrop := ((token.HighestMultiplier - token.CurrentMultiplier) / token.HighestMultiplier) * 100
+		updateStatusAndLog(token.RowIndex, "MONITORING",
+			"🛑 STOP-LOSS TRIGGERED! %s | Current: %.2fx | Stop: %.2fx | Peak was: %.2fx | Dropped %.1f%% from peak",
+			token.TokenName, token.CurrentMultiplier, token.StopLossMultiplier, token.HighestMultiplier, percentDrop)
+	}
+
+	// Update sheet with current data
+	updateMonitoringData(token)
+}
+
+// Remove startMonitoring logging - only console output
+func startMonitoring(token TokenMonitoring) {
+	log.Printf("🆕 Starting to monitor: %s", token.TokenAddress)
+
+	// Get token metadata
+	tokenName, startMarketCap, err := getTokenMetadata(token.TokenAddress)
+	if err != nil {
+		log.Printf("⚠️ Could not get token metadata for %s: %v", token.TokenAddress, err)
+		tokenName = "Unknown Token"
+		startMarketCap = 0
+	}
+
+	token.TokenName = tokenName
+	token.MonitorStartMarketCap = startMarketCap
+
+	// Update status only, no logging
+	vrStatus := &sheets.ValueRange{Values: [][]interface{}{{"INITIALIZING"}}}
+	rangeStrStatus := fmt.Sprintf("%s!C%d", appConfig.SheetName, token.RowIndex)
+	sheetsSvc.Spreadsheets.Values.Update(
+		appConfig.SpreadsheetID, rangeStrStatus, vrStatus).ValueInputOption("RAW").Do()
+
+	// Get starting price
+	price, err := getJupiterPrice(token.TokenAddress)
+	if err != nil {
+		log.Printf("⚠️ Could not get starting price for %s: %v", token.TokenAddress, err)
+		vrStatus = &sheets.ValueRange{Values: [][]interface{}{{"FAILED"}}}
+		sheetsSvc.Spreadsheets.Values.Update(
+			appConfig.SpreadsheetID, rangeStrStatus, vrStatus).ValueInputOption("RAW").Do()
+		return
+	}
+
+	// Initialize monitoring data
+	token.MonitorStartPrice = price
+	token.CurrentPrice = price
+	token.HighestPrice = price
+	token.CurrentMarketCap = startMarketCap
+	token.HighestMarketCap = startMarketCap
+	token.CurrentMultiplier = 1.0
+	token.HighestMultiplier = 1.0
+	token.TrailingStopLoss = 0 // No initial stop-loss
+	token.StopLossMultiplier = 0
+	token.ConsecutiveDownticks = 0
+	token.LastPriceDirection = "STABLE"
+	token.StopLossHistory = []StopLossUpdate{}
+
+	// Update status to MONITORING - no verbose logging
+	vrStatus = &sheets.ValueRange{Values: [][]interface{}{{"MONITORING"}}}
+	sheetsSvc.Spreadsheets.Values.Update(
+		appConfig.SpreadsheetID, rangeStrStatus, vrStatus).ValueInputOption("RAW").Do()
+
+	updateMonitoringData(token)
+	log.Printf("✅ Started monitoring %s at $%.8f", tokenName, price)
 }
