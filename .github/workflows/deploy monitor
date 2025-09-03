@@ -1,0 +1,285 @@
+name: 'Deploy Solana Monitor Bot to EC2 with CloudWatch'
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  DOCKER_IMAGE: "solana_monitor_bot"
+  DOCKER_TAG: ${{ github.sha }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: |
+          ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE }}:latest
+          ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }}
+        platforms: linux/amd64
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Deploy Monitor Bot to EC2 with CloudWatch Setup
+      uses: appleboy/ssh-action@v1.0.0
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USER }}
+        key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+        port: ${{ secrets.EC2_PORT }}
+        script: |
+          TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+          
+          # Install CloudWatch Agent if not already installed
+          if ! command -v /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl &> /dev/null; then
+            echo "Installing CloudWatch Agent..."
+            wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon-linux/amd64/latest/amazon-cloudwatch-agent.rpm
+            sudo rpm -U ./amazon-cloudwatch-agent.rpm
+          fi
+
+          # Create CloudWatch Agent configuration for monitoring bot
+          sudo tee /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json > /dev/null <<EOF
+          {
+            "agent": {
+              "metrics_collection_interval": 10,
+              "run_as_user": "cwagent"
+            },
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    {
+                      "file_path": "/home/${{ secrets.EC2_USER }}/logs/monitor-current.log",
+                      "log_group_name": "/aws/ec2/solana-monitor-bot",
+                      "log_stream_name": "monitor-bot-{instance_id}",
+                      "retention_in_days": 14,
+                      "multi_line_start_pattern": "^\\[\\d{4}-\\d{2}-\\d{2}",
+                      "timezone": "UTC"
+                    },
+                    {
+                      "file_path": "/home/${{ secrets.EC2_USER }}/logs/stop-loss-tracking.log",
+                      "log_group_name": "/aws/ec2/solana-monitor-stoploss",
+                      "log_stream_name": "stop-loss-tracking-{instance_id}",
+                      "retention_in_days": 30,
+                      "timezone": "UTC"
+                    },
+                    {
+                      "file_path": "/home/${{ secrets.EC2_USER }}/logs/ath-alerts.log",
+                      "log_group_name": "/aws/ec2/solana-monitor-ath",
+                      "log_stream_name": "ath-alerts-{instance_id}",
+                      "retention_in_days": 30,
+                      "timezone": "UTC"
+                    },
+                    {
+                      "file_path": "/home/${{ secrets.EC2_USER }}/logs/telegram-calls.log",
+                      "log_group_name": "/aws/ec2/solana-monitor-calls",
+                      "log_stream_name": "telegram-calls-{instance_id}",
+                      "retention_in_days": 90,
+                      "timezone": "UTC"
+                    }
+                  ]
+                }
+              }
+            },
+            "metrics": {
+              "namespace": "SolanaMonitorBot",
+              "metrics_collected": {
+                "cpu": {
+                  "measurement": ["cpu_usage_idle", "cpu_usage_iowait", "cpu_usage_user", "cpu_usage_system"],
+                  "metrics_collection_interval": 10
+                },
+                "disk": {
+                  "measurement": ["used_percent"],
+                  "metrics_collection_interval": 10,
+                  "resources": ["*"]
+                },
+                "mem": {
+                  "measurement": ["mem_used_percent"],
+                  "metrics_collection_interval": 10
+                }
+              }
+            }
+          }
+          EOF
+
+          # Start CloudWatch Agent with new config
+          sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a fetch-config -m ec2 -s \
+            -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
+          # Log in to Docker Hub on EC2
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login --username "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+          # Stop and remove existing container
+          docker stop solana_monitor_bot 2>/dev/null || true
+          docker rm solana_monitor_bot 2>/dev/null || true
+
+          # Remove old image to force fresh pull
+          docker rmi ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE }}:latest 2>/dev/null || true
+
+          # Pull latest image
+          docker pull ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE }}:latest
+
+          # Create credentials.json file from base64
+          echo "${{ secrets.GOOGLE_CREDENTIALS_JSON }}" | base64 -d > /home/${{ secrets.EC2_USER }}/credentials.json
+          
+          # Verify credentials file
+          if [ ! -f /home/${{ secrets.EC2_USER }}/credentials.json ]; then
+            echo "❌ Failed to create credentials.json"
+            exit 1
+          fi
+
+          # Create logs directory structure for monitoring
+          mkdir -p /home/${{ secrets.EC2_USER }}/logs
+          touch /home/${{ secrets.EC2_USER }}/logs/monitor-current.log
+          touch /home/${{ secrets.EC2_USER }}/logs/stop-loss-tracking.log
+          touch /home/${{ secrets.EC2_USER }}/logs/ath-alerts.log
+          touch /home/${{ secrets.EC2_USER }}/logs/telegram-calls.log
+
+          # Run new monitoring container
+          docker run -d \
+            --name solana_monitor_bot \
+            --restart unless-stopped \
+            --dns 8.8.8.8 \
+            --dns 1.1.1.1 \
+            -e SPREADSHEET_ID="${{ secrets.SPREADSHEET_ID }}" \
+            -e SHEET_NAME="SolanaMonitoring" \
+            -e HELIUS_RPC_URL="${{ secrets.HELIUS_RPC_URL }}" \
+            -e TICK_INTERVAL_SECONDS="10" \
+            -e USDC_TOKEN_ADDRESS="${{ secrets.USDC_TOKEN_ADDRESS }}" \
+            -e SLIPPAGE_BPS="100" \
+            -e ENABLE_DETAILED_LOGGING="true" \
+            -v /home/${{ secrets.EC2_USER }}/credentials.json:/app/credentials.json:ro \
+            -v /home/${{ secrets.EC2_USER }}/logs:/app/logs \
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE }}:latest
+
+          # Wait for container to start
+          sleep 15
+
+          # Show container status
+          if docker ps | grep -q solana_monitor_bot; then
+            echo "✅ Monitor container is running"
+            docker logs solana_monitor_bot --tail 20
+            
+            # Set up specialized log monitoring script for tracking
+            cat > /home/${{ secrets.EC2_USER }}/monitor_tracking.sh << 'MONITOR_EOF'
+          #!/bin/bash
+          
+          # Monitor bot logs and extract key information for tracking
+          docker logs solana_monitor_bot --follow --tail 0 2>&1 | while read line; do
+            echo "$line" >> /home/${{ secrets.EC2_USER }}/logs/monitor-current.log
+            
+            # Extract stop-loss tracking updates
+            if echo "$line" | grep -q "TRAILING STOP-LOSS\|🛡️.*STOP-LOSS UPDATE\|Stop-Loss.*→"; then
+              echo "$(date '+%Y-%m-%d %H:%M:%S') $line" >> /home/${{ secrets.EC2_USER }}/logs/stop-loss-tracking.log
+            fi
+            
+            # Extract ATH alerts
+            if echo "$line" | grep -q "NEW ATH\|MAJOR ATH\|ATH.*🚀\|ATH.*🔥"; then
+              echo "$(date '+%Y-%m-%d %H:%M:%S') $line" >> /home/${{ secrets.EC2_USER }}/logs/ath-alerts.log
+            fi
+            
+            # Extract telegram call monitoring
+            if echo "$line" | grep -q "MONITORING STARTED\|Starting to monitor\|New token detected"; then
+              echo "$(date '+%Y-%m-%d %H:%M:%S') $line" >> /home/${{ secrets.EC2_USER }}/logs/telegram-calls.log
+            fi
+            
+            # Extract triggered alerts (even though we don't sell)
+            if echo "$line" | grep -q "STOP-LOSS TRIGGERED\|🛑.*TRIGGERED"; then
+              echo "$(date '+%Y-%m-%d %H:%M:%S') ALERT: $line" >> /home/${{ secrets.EC2_USER }}/logs/stop-loss-tracking.log
+            fi
+          done &
+          MONITOR_EOF
+            
+            chmod +x /home/${{ secrets.EC2_USER }}/monitor_tracking.sh
+            nohup /home/${{ secrets.EC2_USER }}/monitor_tracking.sh > /dev/null 2>&1 &
+            
+          else
+            echo "❌ Monitor container failed to start"
+            docker logs solana_monitor_bot --tail 50 || true
+            exit 1
+          fi
+
+          # Create specialized CloudWatch dashboard for monitoring
+          aws cloudwatch put-dashboard --region ${{ secrets.AWS_REGION || 'us-east-1' }} --dashboard-name "SolanaMonitorBot" --dashboard-body '{
+            "widgets": [
+              {
+                "type": "log",
+                "x": 0,
+                "y": 0,
+                "width": 8,
+                "height": 6,
+                "properties": {
+                  "query": "SOURCE \"/aws/ec2/solana-monitor-stoploss\" | fields @timestamp, @message\n| filter @message like /TRAILING STOP-LOSS/\n| sort @timestamp desc\n| limit 50",
+                  "region": "${{ secrets.AWS_REGION || 'us-east-1' }}",
+                  "title": "Trailing Stop-Loss Updates",
+                  "view": "table"
+                }
+              },
+              {
+                "type": "log",
+                "x": 8,
+                "y": 0,
+                "width": 8,
+                "height": 6,
+                "properties": {
+                  "query": "SOURCE \"/aws/ec2/solana-monitor-ath\" | fields @timestamp, @message\n| filter @message like /ATH/\n| sort @timestamp desc\n| limit 30",
+                  "region": "${{ secrets.AWS_REGION || 'us-east-1' }}",
+                  "title": "All-Time High Alerts",
+                  "view": "table"
+                }
+              },
+              {
+                "type": "log",
+                "x": 16,
+                "y": 0,
+                "width": 8,
+                "height": 6,
+                "properties": {
+                  "query": "SOURCE \"/aws/ec2/solana-monitor-calls\" | fields @timestamp, @message\n| filter @message like /MONITORING STARTED/\n| sort @timestamp desc\n| limit 20",
+                  "region": "${{ secrets.AWS_REGION || 'us-east-1' }}",
+                  "title": "New Telegram Calls",
+                  "view": "table"
+                }
+              },
+              {
+                "type": "log",
+                "x": 0,
+                "y": 6,
+                "width": 24,
+                "height": 6,
+                "properties": {
+                  "query": "SOURCE \"/aws/ec2/solana-monitor-stoploss\" | fields @timestamp, @message\n| filter @message like /TRIGGERED/\n| sort @timestamp desc\n| limit 10",
+                  "region": "${{ secrets.AWS_REGION || 'us-east-1' }}",
+                  "title": "Stop-Loss Triggered Alerts (Monitoring Only)",
+                  "view": "table"
+                }
+              }
+            ]
+          }' || echo "Warning: Could not create CloudWatch dashboard (check AWS permissions)"
+
+          # Save deployment logs
+          docker logs solana_monitor_bot --tail 100 > /home/${{ secrets.EC2_USER }}/logs/monitor-logs-$TIMESTAMP.txt 2>&1 || true
+          
+          # Logout from Docker Hub
+          docker logout
+
+          echo "✅ Solana Monitor Bot deployment complete with CloudWatch tracking enabled"
