@@ -163,7 +163,7 @@ jobs:
             -e SPREADSHEET_ID="${{ secrets.SPREADSHEET_ID }}" \
             -e SHEET_NAME="SolanaMonitoring" \
             -e HELIUS_RPC_URL="${{ secrets.HELIUS_RPC_URL }}" \
-            -e TICK_INTERVAL_SECONDS="10" \
+            -e TICK_INTERVAL_SECONDS="4" \
             -e USDC_TOKEN_ADDRESS="${{ secrets.USDC_TOKEN_ADDRESS }}" \
             -e SLIPPAGE_BPS="100" \
             -e ENABLE_DETAILED_LOGGING="true" \
