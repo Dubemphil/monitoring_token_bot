@@ -1,4 +1,4 @@
-// main.go - Solana Token Monitoring Bot for Telegram Calls
+// main.go - Solana Token Monitoring Bot for Telegram Calls.
 package main
 
 import (
