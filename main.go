@@ -688,3 +688,285 @@ func handleStopLossUpdate(token TokenMonitoring, oldStopLoss, newStopLoss, oldSt
 			token.TokenName, oldStopMultiplier, newStopMultiplier, token.HighestMultiplier, profitIncrease, token.CurrentMarketCap)
 	} else if newStopLoss < oldStopLoss && newStopLoss > 0 {
 		// Stop-loss was lowered (shouldn't happen normally, but good to track)
+		profitDecrease := (oldStopMultiplier - newStopMultiplier) * 100
+		updateStatusAndLog(token.RowIndex, "MONITORING",
+			"📉 STOP-LOSS LOWERED: %s | %.2fx → %.2fx | Peak: %.2fx | Profit secured %.1f%% less | MC: $%.0f",
+			token.TokenName, oldStopMultiplier, newStopMultiplier, token.HighestMultiplier, profitDecrease, token.CurrentMarketCap)
+	}
+}
+
+// Calculate trailing stop-loss based on current performance
+func calculateTrailingStopLoss(token TokenMonitoring) (float64, float64) {
+	multiplier := token.HighestMultiplier
+	
+	// No stop-loss until we hit 2x
+	if multiplier < 2.0 {
+		return 0, 0
+	}
+	
+	// Calculate stop-loss percentage based on performance tiers
+	var stopLossPercentage float64
+	switch {
+	case multiplier >= 100.0:
+		stopLossPercentage = 0.87 // Keep 87% of gains (13% trailing stop)
+	case multiplier >= 50.0:
+		stopLossPercentage = 0.86 // Keep 86% of gains (14% trailing stop)
+	case multiplier >= 20.0:
+		stopLossPercentage = 0.85 // Keep 85% of gains (15% trailing stop)
+	case multiplier >= 10.0:
+		stopLossPercentage = 0.83 // Keep 83% of gains (17% trailing stop)
+	case multiplier >= 4.0:
+		stopLossPercentage = 0.80 // Keep 80% of gains (20% trailing stop)
+	case multiplier >= 2.0:
+		stopLossPercentage = 0.78 // Keep 78% of gains (22% trailing stop)
+		// But never go below 1.3x (30% minimum profit)
+		if multiplier*stopLossPercentage < 1.3 {
+			stopLossPercentage = 1.3 / multiplier
+		}
+	default:
+		return 0, 0
+	}
+	
+	stopLossMultiplier := multiplier * stopLossPercentage
+	stopLossPrice := token.MonitorStartPrice * stopLossMultiplier
+	
+	return stopLossPrice, stopLossMultiplier
+}
+
+// Read monitoring list from Google Sheets
+func readMonitoringListFromSheet() ([]TokenMonitoring, error) {
+	rangeStr := fmt.Sprintf("%s!A2:Q1000", appConfig.SheetName)
+	resp, err := sheetsSvc.Spreadsheets.Values.Get(appConfig.SpreadsheetID, rangeStr).Do()
+	if err != nil {
+		return nil, fmt.Errorf("unable to retrieve data from sheet: %v", err)
+	}
+
+	var tokens []TokenMonitoring
+	for i, row := range resp.Values {
+		if len(row) == 0 || row[0] == "" {
+			continue
+		}
+
+		token := TokenMonitoring{
+			RowIndex:     i + 2, // Sheet rows start at 1, data starts at row 2
+			TokenAddress: toString(row[0]),
+		}
+
+		// Parse existing data if available
+		if len(row) > 1 {
+			token.TokenName = toString(row[1])
+		}
+		if len(row) > 2 {
+			token.Status = toString(row[2])
+		}
+		if len(row) > 3 {
+			token.CallSource = toString(row[3])
+		}
+		if len(row) > 4 {
+			if callTimeStr := toString(row[4]); callTimeStr != "" {
+				if parsed, err := time.Parse("2006-01-02 15:04:05", callTimeStr); err == nil {
+					token.CallTime = parsed
+				}
+			}
+		}
+		if len(row) > 5 {
+			token.MonitorStartPrice = toFloat(row[5])
+		}
+		if len(row) > 6 {
+			token.CurrentPrice = toFloat(row[6])
+		}
+		if len(row) > 7 {
+			token.MonitorStartMarketCap = toFloat(row[7])
+		}
+		if len(row) > 8 {
+			token.CurrentMarketCap = toFloat(row[8])
+		}
+		if len(row) > 9 {
+			token.HighestMarketCap = toFloat(row[9])
+		}
+		if len(row) > 10 {
+			token.HighestMultiplier = toFloat(row[10])
+		}
+		if len(row) > 11 {
+			token.CurrentMultiplier = toFloat(row[11])
+		}
+		if len(row) > 13 {
+			token.TrailingStopLoss = toFloat(row[13])
+		}
+		if len(row) > 14 {
+			token.StopLossMultiplier = toFloat(row[14])
+		}
+
+		// Set highest price from multiplier if not set
+		if token.HighestPrice == 0 && token.MonitorStartPrice > 0 && token.HighestMultiplier > 0 {
+			token.HighestPrice = token.MonitorStartPrice * token.HighestMultiplier
+		}
+
+		tokens = append(tokens, token)
+	}
+
+	return tokens, nil
+}
+
+// Get current token price using Jupiter API
+func getJupiterPrice(tokenAddress string) (float64, error) {
+	// Use 1000 USDC worth for price calculation (more accurate for small cap tokens)
+	usdcAmount := "1000000000" // 1000 USDC (6 decimals)
+
+	url := fmt.Sprintf("%s?inputMint=%s&outputMint=%s&amount=%s&slippageBps=%d&restrictIntermediateTokens=true",
+		jupiterEndpoints.QuoteV1,
+		appConfig.USDCTokenAddress,
+		tokenAddress,
+		usdcAmount,
+		appConfig.SlippageBps,
+	)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return 0, fmt.Errorf("Jupiter API request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return 0, fmt.Errorf("Jupiter API returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read response: %v", err)
+	}
+
+	var quote JupiterQuoteResponse
+	if err := json.Unmarshal(body, &quote); err != nil {
+		return 0, fmt.Errorf("failed to parse quote response: %v", err)
+	}
+
+	// Parse amounts
+	inAmountFloat, err := strconv.ParseFloat(quote.InAmount, 64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse input amount: %v", err)
+	}
+
+	outAmountFloat, err := strconv.ParseFloat(quote.OutAmount, 64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse output amount: %v", err)
+	}
+
+	// Calculate price per token
+	// Price = USDC_spent / tokens_received
+	// We normalize to get price per single token unit
+	price := inAmountFloat / outAmountFloat
+
+	return price, nil
+}
+
+// Update monitoring data in Google Sheets
+func updateMonitoringData(token TokenMonitoring) error {
+	// Calculate P/L percentage
+	var plPercent float64
+	if token.MonitorStartPrice > 0 {
+		plPercent = ((token.CurrentPrice - token.MonitorStartPrice) / token.MonitorStartPrice) * 100
+	}
+
+	// Format stop-loss history for display
+	var stopLossUpdatesStr string
+	if len(token.StopLossHistory) > 0 {
+		recent := token.StopLossHistory
+		if len(recent) > 3 {
+			recent = recent[len(recent)-3:] // Show only last 3 updates
+		}
+		
+		var updates []string
+		for _, update := range recent {
+			updates = append(updates, fmt.Sprintf("%s: %.2fx→%.2fx (%s)",
+				update.Timestamp.Format("15:04"), update.OldMultiplier, update.NewMultiplier, update.Reason[:min(20, len(update.Reason))]))
+		}
+		stopLossUpdatesStr = strings.Join(updates, "; ")
+	}
+
+	// Prepare row data
+	rowData := []interface{}{
+		token.TokenAddress,
+		token.TokenName,
+		token.Status,
+		token.CallSource,
+		token.CallTime.Format("2006-01-02 15:04:05"),
+		token.MonitorStartPrice,
+		token.CurrentPrice,
+		token.MonitorStartMarketCap,
+		token.CurrentMarketCap,
+		token.HighestMarketCap,
+		token.HighestMultiplier,
+		token.CurrentMultiplier,
+		plPercent,
+		token.TrailingStopLoss,
+		token.StopLossMultiplier,
+		stopLossUpdatesStr,
+		"", // Log column will be updated separately
+	}
+
+	vr := &sheets.ValueRange{Values: [][]interface{}{rowData}}
+	rangeStr := fmt.Sprintf("%s!A%d:Q%d", appConfig.SheetName, token.RowIndex, token.RowIndex)
+
+	_, err := sheetsSvc.Spreadsheets.Values.Update(
+		appConfig.SpreadsheetID, rangeStr, vr).ValueInputOption("RAW").Do()
+
+	return err
+}
+
+// Update status and add log entry
+func updateStatusAndLog(rowIndex int, status string, logFormat string, args ...interface{}) {
+	// Update status
+	vrStatus := &sheets.ValueRange{Values: [][]interface{}{{status}}}
+	rangeStrStatus := fmt.Sprintf("%s!C%d", appConfig.SheetName, rowIndex)
+	sheetsSvc.Spreadsheets.Values.Update(
+		appConfig.SpreadsheetID, rangeStrStatus, vrStatus).ValueInputOption("RAW").Do()
+
+	// Add log entry with timestamp
+	logMessage := fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), fmt.Sprintf(logFormat, args...))
+	
+	// Log to console
+	log.Println(logMessage)
+	
+	// Update log column in sheet
+	vrLog := &sheets.ValueRange{Values: [][]interface{}{{logMessage}}}
+	rangeStrLog := fmt.Sprintf("%s!Q%d", appConfig.SheetName, rowIndex)
+	sheetsSvc.Spreadsheets.Values.Update(
+		appConfig.SpreadsheetID, rangeStrLog, vrLog).ValueInputOption("RAW").Do()
+}
+
+// Utility functions for type conversion
+func toString(value interface{}) string {
+	if value == nil {
+		return ""
+	}
+	return fmt.Sprintf("%v", value)
+}
+
+func toFloat(value interface{}) float64 {
+	if value == nil {
+		return 0
+	}
+	
+	str := fmt.Sprintf("%v", value)
+	if str == "" {
+		return 0
+	}
+	
+	result, err := strconv.ParseFloat(str, 64)
+	if err != nil {
+		return 0
+	}
+	
+	return result
+}
+
+// Helper function for min operation
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
