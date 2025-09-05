@@ -441,8 +441,6 @@ func startMonitoring(token TokenMonitoring) {
 	log.Printf("✅ Started monitoring %s at $%.8f", tokenName, price)
 }
 
-// Enhanced monitoring functions with comprehensive logging
-
 func monitorActiveToken(token TokenMonitoring) {
 	log.Printf("👀 Monitoring: %s (%s) - Current: %.2fx", 
 		token.TokenName, token.TokenAddress[:8], token.CurrentMultiplier)
@@ -527,8 +525,6 @@ func monitorActiveToken(token TokenMonitoring) {
 	// Update sheet with current data
 	updateMonitoringData(token)
 }
-
-// Log ATH achievements with different messaging based on multiplier levels
 func logATHAchievement(token TokenMonitoring) {
 	multiplier := token.HighestMultiplier
 	
@@ -690,147 +686,174 @@ func handleStopLossUpdate(token TokenMonitoring, oldStopLoss, newStopLoss, oldSt
 		// Stop-loss was lowered (shouldn't happen normally, but good to track)
 		profitDecrease := (oldStopMultiplier - newStopMultiplier) * 100
 		updateStatusAndLog(token.RowIndex, "MONITORING",
-			"📉 STOP-LOSS LOWERED: %s | %.2fx → %.2fx | Peak: %.2fx | Profit secured %.1f%% less | MC: $%.0f",
+			"📉 STOP-LOSS ADJUSTED DOWN: %s | %.2fx → %.2fx | Peak: %.2fx | Protection reduced %.1f%% | MC: $%.0f",
 			token.TokenName, oldStopMultiplier, newStopMultiplier, token.HighestMultiplier, profitDecrease, token.CurrentMarketCap)
 	}
+
+	// Always log the detailed update
+	logStopLossUpdate(token.RowIndex, stopLossUpdate)
 }
 
-// Calculate trailing stop-loss based on current performance
 func calculateTrailingStopLoss(token TokenMonitoring) (float64, float64) {
-	multiplier := token.HighestMultiplier
-	
-	// No stop-loss until we hit 2x
-	if multiplier < 2.0 {
+	if token.MonitorStartPrice <= 0 {
 		return 0, 0
 	}
-	
-	// Calculate stop-loss percentage based on performance tiers
-	var stopLossPercentage float64
+
+	highestMultiplier := token.HighestPrice / token.MonitorStartPrice
+
+	// No stop-loss until 2x is reached
+	if highestMultiplier < 2.0 {
+		return 0, 0
+	}
+
+	// Progressive stop-loss logic
+	var baseStopLossMultiplier float64
+
 	switch {
-	case multiplier >= 100.0:
-		stopLossPercentage = 0.87 // Keep 87% of gains (13% trailing stop)
-	case multiplier >= 50.0:
-		stopLossPercentage = 0.86 // Keep 86% of gains (14% trailing stop)
-	case multiplier >= 20.0:
-		stopLossPercentage = 0.85 // Keep 85% of gains (15% trailing stop)
-	case multiplier >= 10.0:
-		stopLossPercentage = 0.83 // Keep 83% of gains (17% trailing stop)
-	case multiplier >= 4.0:
-		stopLossPercentage = 0.80 // Keep 80% of gains (20% trailing stop)
-	case multiplier >= 2.0:
-		stopLossPercentage = 0.78 // Keep 78% of gains (22% trailing stop)
-		// But never go below 1.3x (30% minimum profit)
-		if multiplier*stopLossPercentage < 1.3 {
-			stopLossPercentage = 1.3 / multiplier
-		}
+	case highestMultiplier >= 500:
+		baseStopLossMultiplier = highestMultiplier * 0.88
+	case highestMultiplier >= 100:
+		baseStopLossMultiplier = highestMultiplier * 0.87
+	case highestMultiplier >= 50:
+		baseStopLossMultiplier = highestMultiplier * 0.86
+	case highestMultiplier >= 20:
+		baseStopLossMultiplier = highestMultiplier * 0.85
+	case highestMultiplier >= 10:
+		baseStopLossMultiplier = highestMultiplier * 0.83
+	case highestMultiplier >= 4:
+		baseStopLossMultiplier = highestMultiplier * 0.80
+	case highestMultiplier >= 2:
+		baseStopLossMultiplier = math.Max(highestMultiplier*0.78, 1.3)
 	default:
 		return 0, 0
 	}
-	
-	stopLossMultiplier := multiplier * stopLossPercentage
-	stopLossPrice := token.MonitorStartPrice * stopLossMultiplier
-	
-	return stopLossPrice, stopLossMultiplier
-}
 
-// Read monitoring list from Google Sheets
-func readMonitoringListFromSheet() ([]TokenMonitoring, error) {
-	rangeStr := fmt.Sprintf("%s!A2:Q1000", appConfig.SheetName)
-	resp, err := sheetsSvc.Spreadsheets.Values.Get(appConfig.SpreadsheetID, rangeStr).Do()
-	if err != nil {
-		return nil, fmt.Errorf("unable to retrieve data from sheet: %v", err)
+	// Volatility adjustment
+	adjustedStopLossMultiplier := baseStopLossMultiplier
+	if token.ConsecutiveDownticks >= 3 {
+		volatilityAdjustment := 0.95
+		adjustedStopLossMultiplier = baseStopLossMultiplier * volatilityAdjustment
 	}
 
-	var tokens []TokenMonitoring
-	for i, row := range resp.Values {
-		if len(row) == 0 || row[0] == "" {
+	// Ensure minimum profitable levels
+	switch {
+	case highestMultiplier >= 10:
+		adjustedStopLossMultiplier = math.Max(adjustedStopLossMultiplier, 5.0)
+	case highestMultiplier >= 5:
+		adjustedStopLossMultiplier = math.Max(adjustedStopLossMultiplier, 2.5)
+	case highestMultiplier >= 2:
+		adjustedStopLossMultiplier = math.Max(adjustedStopLossMultiplier, 1.2)
+	}
+
+	stopLossPrice := token.MonitorStartPrice * adjustedStopLossMultiplier
+	return stopLossPrice, adjustedStopLossMultiplier
+}
+
+func getJupiterPrice(tokenAddress string) (float64, error) {
+	price, err := getPriceFromQuote(tokenAddress)
+	if err == nil && price > 0 {
+		return price, nil
+	}
+	log.Printf("⚠️ Quote API failed for %s: %v", tokenAddress, err)
+
+	return getPriceFromAlternativeEndpoints(tokenAddress)
+}
+
+func getPriceFromQuote(tokenAddress string) (float64, error) {
+	testAmounts := []string{"1000000", "100000", "10000", "1000"}
+
+	for i, testAmount := range testAmounts {
+		url := fmt.Sprintf("%s?inputMint=%s&outputMint=%s&amount=%s&slippageBps=%d&restrictIntermediateTokens=true",
+			jupiterEndpoints.QuoteV1,
+			tokenAddress,
+			appConfig.USDCTokenAddress,
+			testAmount,
+			appConfig.SlippageBps,
+		)
+
+		client := &http.Client{Timeout: 15 * time.Second}
+		resp, err := client.Get(url)
+		if err != nil {
+			if i == len(testAmounts)-1 {
+				return 0, fmt.Errorf("quote request failed: %v", err)
+			}
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			body, _ := ioutil.ReadAll(resp.Body)
+			if i == len(testAmounts)-1 {
+				return 0, fmt.Errorf("quote failed with status %d: %s", resp.StatusCode, string(body))
+			}
 			continue
 		}
 
-		token := TokenMonitoring{
-			RowIndex:     i + 2, // Sheet rows start at 1, data starts at row 2
-			TokenAddress: toString(row[0]),
-		}
-
-		// Parse existing data if available
-		if len(row) > 1 {
-			token.TokenName = toString(row[1])
-		}
-		if len(row) > 2 {
-			token.Status = toString(row[2])
-		}
-		if len(row) > 3 {
-			token.CallSource = toString(row[3])
-		}
-		if len(row) > 4 {
-			if callTimeStr := toString(row[4]); callTimeStr != "" {
-				if parsed, err := time.Parse("2006-01-02 15:04:05", callTimeStr); err == nil {
-					token.CallTime = parsed
-				}
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			if i == len(testAmounts)-1 {
+				return 0, fmt.Errorf("failed to read response: %v", err)
 			}
-		}
-		if len(row) > 5 {
-			token.MonitorStartPrice = toFloat(row[5])
-		}
-		if len(row) > 6 {
-			token.CurrentPrice = toFloat(row[6])
-		}
-		if len(row) > 7 {
-			token.MonitorStartMarketCap = toFloat(row[7])
-		}
-		if len(row) > 8 {
-			token.CurrentMarketCap = toFloat(row[8])
-		}
-		if len(row) > 9 {
-			token.HighestMarketCap = toFloat(row[9])
-		}
-		if len(row) > 10 {
-			token.HighestMultiplier = toFloat(row[10])
-		}
-		if len(row) > 11 {
-			token.CurrentMultiplier = toFloat(row[11])
-		}
-		if len(row) > 13 {
-			token.TrailingStopLoss = toFloat(row[13])
-		}
-		if len(row) > 14 {
-			token.StopLossMultiplier = toFloat(row[14])
+			continue
 		}
 
-		// Set highest price from multiplier if not set
-		if token.HighestPrice == 0 && token.MonitorStartPrice > 0 && token.HighestMultiplier > 0 {
-			token.HighestPrice = token.MonitorStartPrice * token.HighestMultiplier
+		var quote JupiterQuoteResponse
+		if err := json.Unmarshal(body, &quote); err != nil {
+			if i == len(testAmounts)-1 {
+				return 0, fmt.Errorf("failed to parse quote: %v", err)
+			}
+			continue
 		}
 
-		tokens = append(tokens, token)
+		inAmount, err := strconv.ParseFloat(quote.InAmount, 64)
+		if err != nil {
+			continue
+		}
+
+		outAmount, err := strconv.ParseFloat(quote.OutAmount, 64)
+		if err != nil {
+			continue
+		}
+
+		if inAmount == 0 {
+			continue
+		}
+
+		price := outAmount / inAmount
+
+		if price < 0.000001 && price > 0 {
+			price = price * 1000000
+		}
+
+		if price > 0 {
+			return price, nil
+		}
 	}
 
-	return tokens, nil
+	return 0, fmt.Errorf("could not get valid price with any test amount")
 }
 
-// Get current token price using Jupiter API
-func getJupiterPrice(tokenAddress string) (float64, error) {
-	// Use 1000 USDC worth for price calculation (more accurate for small cap tokens)
-	usdcAmount := "1000000000" // 1000 USDC (6 decimals)
+func getPriceFromAlternativeEndpoints(tokenAddress string) (float64, error) {
+	testUSDCAmount := "1000000" // 1 USDC
 
 	url := fmt.Sprintf("%s?inputMint=%s&outputMint=%s&amount=%s&slippageBps=%d&restrictIntermediateTokens=true",
 		jupiterEndpoints.QuoteV1,
 		appConfig.USDCTokenAddress,
 		tokenAddress,
-		usdcAmount,
+		testUSDCAmount,
 		appConfig.SlippageBps,
 	)
 
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
-		return 0, fmt.Errorf("Jupiter API request failed: %v", err)
+		return 0, fmt.Errorf("reverse quote failed: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
 		body, _ := ioutil.ReadAll(resp.Body)
-		return 0, fmt.Errorf("Jupiter API returned status %d: %s", resp.StatusCode, string(body))
+		return 0, fmt.Errorf("reverse quote failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
 	body, err := ioutil.ReadAll(resp.Body)
@@ -840,133 +863,230 @@ func getJupiterPrice(tokenAddress string) (float64, error) {
 
 	var quote JupiterQuoteResponse
 	if err := json.Unmarshal(body, &quote); err != nil {
-		return 0, fmt.Errorf("failed to parse quote response: %v", err)
+		return 0, fmt.Errorf("failed to parse reverse quote: %v", err)
 	}
 
-	// Parse amounts
-	inAmountFloat, err := strconv.ParseFloat(quote.InAmount, 64)
+	inAmount, err := strconv.ParseFloat(quote.InAmount, 64)  // USDC input
 	if err != nil {
-		return 0, fmt.Errorf("failed to parse input amount: %v", err)
+		return 0, fmt.Errorf("invalid inAmount in reverse quote: %v", err)
 	}
 
-	outAmountFloat, err := strconv.ParseFloat(quote.OutAmount, 64)
+	outAmount, err := strconv.ParseFloat(quote.OutAmount, 64) // Token output
 	if err != nil {
-		return 0, fmt.Errorf("failed to parse output amount: %v", err)
+		return 0, fmt.Errorf("invalid outAmount in reverse quote: %v", err)
 	}
 
-	// Calculate price per token
-	// Price = USDC_spent / tokens_received
-	// We normalize to get price per single token unit
-	price := inAmountFloat / outAmountFloat
+	if outAmount == 0 {
+		return 0, fmt.Errorf("invalid token output amount")
+	}
 
+	price := inAmount / outAmount
 	return price, nil
 }
 
-// Update monitoring data in Google Sheets
-func updateMonitoringData(token TokenMonitoring) error {
-	// Calculate P/L percentage
-	var plPercent float64
-	if token.MonitorStartPrice > 0 {
-		plPercent = ((token.CurrentPrice - token.MonitorStartPrice) / token.MonitorStartPrice) * 100
+// Sheet Functions
+
+func readMonitoringListFromSheet() ([]TokenMonitoring, error) {
+	readRange := fmt.Sprintf("%s!A2:Q", appConfig.SheetName)
+	resp, err := sheetsSvc.Spreadsheets.Values.Get(appConfig.SpreadsheetID, readRange).Do()
+	if err != nil {
+		return nil, err
 	}
 
-	// Format stop-loss history for display
-	var stopLossUpdatesStr string
-	if len(token.StopLossHistory) > 0 {
-		recent := token.StopLossHistory
-		if len(recent) > 3 {
-			recent = recent[len(recent)-3:] // Show only last 3 updates
+	var tokens []TokenMonitoring
+	if len(resp.Values) == 0 {
+		return tokens, nil
+	}
+
+	for i, row := range resp.Values {
+		if len(row) == 0 || row[0] == "" {
+			continue
 		}
-		
-		var updates []string
-		for _, update := range recent {
-			updates = append(updates, fmt.Sprintf("%s: %.2fx→%.2fx (%s)",
-				update.Timestamp.Format("15:04"), update.OldMultiplier, update.NewMultiplier, update.Reason[:min(20, len(update.Reason))]))
+
+		token := TokenMonitoring{
+			RowIndex:     i + 2,
+			TokenAddress: fmt.Sprintf("%v", row[0]),
 		}
-		stopLossUpdatesStr = strings.Join(updates, "; ")
+
+		if len(row) > 1 { token.TokenName = fmt.Sprintf("%v", row[1]) }
+		if len(row) > 2 { token.Status = fmt.Sprintf("%v", row[2]) }
+		if len(row) > 3 { token.CallSource = fmt.Sprintf("%v", row[3]) }
+		// Parse call time if present
+		if len(row) > 4 {
+			if timeStr := fmt.Sprintf("%v", row[4]); timeStr != "" {
+				if callTime, err := time.Parse("2006-01-02 15:04:05", timeStr); err == nil {
+					token.CallTime = callTime
+				}
+			}
+		}
+		if len(row) > 5 { token.MonitorStartPrice, _ = strconv.ParseFloat(fmt.Sprintf("%v", row[5]), 64) }
+		if len(row) > 6 { token.CurrentPrice, _ = strconv.ParseFloat(fmt.Sprintf("%v", row[6]), 64) }
+		if len(row) > 7 { token.MonitorStartMarketCap, _ = strconv.ParseFloat(fmt.Sprintf("%v", row[7]), 64) }
+		if len(row) > 8 { token.CurrentMarketCap, _ = strconv.ParseFloat(fmt.Sprintf("%v", row[8]), 64) }
+		if len(row) > 9 { token.HighestMarketCap, _ = strconv.ParseFloat(fmt.Sprintf("%v", row[9]), 64) }
+		if len(row) > 10 { 
+			peakStr := fmt.Sprintf("%v", row[10])
+			if strings.HasSuffix(peakStr, "x") {
+				peakStr = strings.TrimSuffix(peakStr, "x")
+			}
+			token.HighestMultiplier, _ = strconv.ParseFloat(peakStr, 64) 
+		}
+		if len(row) > 11 { 
+			currentStr := fmt.Sprintf("%v", row[11])
+			if strings.HasSuffix(currentStr, "x") {
+				currentStr = strings.TrimSuffix(currentStr, "x")
+			}
+			token.CurrentMultiplier, _ = strconv.ParseFloat(currentStr, 64) 
+		}
+		if len(row) > 13 { token.TrailingStopLoss, _ = strconv.ParseFloat(fmt.Sprintf("%v", row[13]), 64) }
+		if len(row) > 14 { 
+			stopStr := fmt.Sprintf("%v", row[14])
+			if strings.HasSuffix(stopStr, "x") {
+				stopStr = strings.TrimSuffix(stopStr, "x")
+			}
+			token.StopLossMultiplier, _ = strconv.ParseFloat(stopStr, 64) 
+		}
+
+		if token.Status == "" {
+			token.Status = "NEW"
+		}
+
+		// Initialize tracking fields
+		token.ConsecutiveDownticks = 0
+		token.LastPriceDirection = "STABLE"
+		token.StopLossHistory = []StopLossUpdate{}
+
+		tokens = append(tokens, token)
 	}
-
-	// Prepare row data
-	rowData := []interface{}{
-		token.TokenAddress,
-		token.TokenName,
-		token.Status,
-		token.CallSource,
-		token.CallTime.Format("2006-01-02 15:04:05"),
-		token.MonitorStartPrice,
-		token.CurrentPrice,
-		token.MonitorStartMarketCap,
-		token.CurrentMarketCap,
-		token.HighestMarketCap,
-		token.HighestMultiplier,
-		token.CurrentMultiplier,
-		plPercent,
-		token.TrailingStopLoss,
-		token.StopLossMultiplier,
-		stopLossUpdatesStr,
-		"", // Log column will be updated separately
-	}
-
-	vr := &sheets.ValueRange{Values: [][]interface{}{rowData}}
-	rangeStr := fmt.Sprintf("%s!A%d:Q%d", appConfig.SheetName, token.RowIndex, token.RowIndex)
-
-	_, err := sheetsSvc.Spreadsheets.Values.Update(
-		appConfig.SpreadsheetID, rangeStr, vr).ValueInputOption("RAW").Do()
-
-	return err
+	return tokens, nil
 }
 
-// Update status and add log entry
-func updateStatusAndLog(rowIndex int, status string, logFormat string, args ...interface{}) {
-	// Update status
+func updateMonitoringData(token TokenMonitoring) {
+	profitPercent := 0.0
+	if token.MonitorStartPrice > 0 {
+		profitPercent = ((token.CurrentPrice / token.MonitorStartPrice) - 1) * 100
+	}
+
+	callTimeStr := ""
+	if !token.CallTime.IsZero() {
+		callTimeStr = token.CallTime.Format("2006-01-02 15:04:05")
+	}
+
+	// Ensure market cap values are properly formatted
+	startMarketCapFormatted := token.MonitorStartMarketCap
+	currentMarketCapFormatted := token.CurrentMarketCap
+	highestMarketCapFormatted := token.HighestMarketCap
+
+	// Format large numbers properly
+	if startMarketCapFormatted == 0 {
+		startMarketCapFormatted = 0
+	}
+	if currentMarketCapFormatted == 0 {
+		currentMarketCapFormatted = 0
+	}
+	if highestMarketCapFormatted == 0 {
+		highestMarketCapFormatted = 0
+	}
+
+	vr := &sheets.ValueRange{
+		Values: [][]interface{}{
+			{
+				token.TokenName,
+				token.CallSource,
+				callTimeStr,
+				fmt.Sprintf("%.8f", token.MonitorStartPrice),
+				fmt.Sprintf("%.8f", token.CurrentPrice),
+				fmt.Sprintf("%.0f", startMarketCapFormatted),
+				fmt.Sprintf("%.0f", currentMarketCapFormatted),
+				fmt.Sprintf("%.0f", highestMarketCapFormatted),
+				fmt.Sprintf("%.2fx", token.HighestMultiplier),
+				fmt.Sprintf("%.2fx", token.CurrentMultiplier),
+				fmt.Sprintf("%.1f%%", profitPercent),
+				fmt.Sprintf("%.8f", token.TrailingStopLoss),
+				fmt.Sprintf("%.2fx", token.StopLossMultiplier),
+			},
+		},
+	}
+
+	rangeStr := fmt.Sprintf("%s!B%d:N%d", appConfig.SheetName, token.RowIndex, token.RowIndex)
+	_, err := sheetsSvc.Spreadsheets.Values.Update(
+		appConfig.SpreadsheetID, rangeStr, vr).ValueInputOption("USER_ENTERED").Do()
+
+	if err != nil {
+		log.Printf("⚠️ Failed to update monitoring data: %v", err)
+	}
+}
+// updateStatusAndLog function - only logs stop-loss related events
+func updateStatusAndLog(rowIndex int, status string, logMessage string, args ...interface{}) {
+	// Update Status (column C)
 	vrStatus := &sheets.ValueRange{Values: [][]interface{}{{status}}}
 	rangeStrStatus := fmt.Sprintf("%s!C%d", appConfig.SheetName, rowIndex)
-	sheetsSvc.Spreadsheets.Values.Update(
+	_, err := sheetsSvc.Spreadsheets.Values.Update(
 		appConfig.SpreadsheetID, rangeStrStatus, vrStatus).ValueInputOption("RAW").Do()
-
-	// Add log entry with timestamp
-	logMessage := fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), fmt.Sprintf(logFormat, args...))
-	
-	// Log to console
-	log.Println(logMessage)
-	
-	// Update log column in sheet
-	vrLog := &sheets.ValueRange{Values: [][]interface{}{{logMessage}}}
-	rangeStrLog := fmt.Sprintf("%s!Q%d", appConfig.SheetName, rowIndex)
-	sheetsSvc.Spreadsheets.Values.Update(
-		appConfig.SpreadsheetID, rangeStrLog, vrLog).ValueInputOption("RAW").Do()
-}
-
-// Utility functions for type conversion
-func toString(value interface{}) string {
-	if value == nil {
-		return ""
-	}
-	return fmt.Sprintf("%v", value)
-}
-
-func toFloat(value interface{}) float64 {
-	if value == nil {
-		return 0
-	}
-	
-	str := fmt.Sprintf("%v", value)
-	if str == "" {
-		return 0
-	}
-	
-	result, err := strconv.ParseFloat(str, 64)
 	if err != nil {
-		return 0
+		log.Printf("⚠️ Failed to update status: %v", err)
 	}
-	
-	return result
-}
 
-// Helper function for min operation
-func min(a, b int) int {
-	if a < b {
-		return a
+	// Format the full log message
+	fullLogMessage := fmt.Sprintf(logMessage, args...)
+	
+	// Always log significant events to column Q (main log)
+	timestampedLog := fmt.Sprintf("[%s] %s\n",
+		time.Now().Format("2006-01-02 15:04:05"), fullLogMessage)
+
+	// Get existing log
+	rangeStrLogGet := fmt.Sprintf("%s!Q%d", appConfig.SheetName, rowIndex)
+	resp, err := sheetsSvc.Spreadsheets.Values.Get(appConfig.SpreadsheetID, rangeStrLogGet).Do()
+	if err != nil {
+		log.Printf("⚠️ Failed to read existing log: %v", err)
+		return
 	}
-	return b
+
+	existingLog := ""
+	if len(resp.Values) > 0 && len(resp.Values[0]) > 0 {
+		existingLog = fmt.Sprintf("%v", resp.Values[0][0])
+	}
+
+	newLog := existingLog + timestampedLog
+	vrLog := &sheets.ValueRange{Values: [][]interface{}{{newLog}}}
+	_, err = sheetsSvc.Spreadsheets.Values.Update(
+		appConfig.SpreadsheetID, rangeStrLogGet, vrLog).ValueInputOption("RAW").Do()
+	if err != nil {
+		log.Printf("⚠️ Failed to append log: %v", err)
+	}
+
+	// Always log to console for monitoring
+	log.Printf("📝 Row %d: %s", rowIndex, fullLogMessage)
+}
+// logStopLossUpdate function - logs detailed stop-loss updates to column P
+func logStopLossUpdate(rowIndex int, update StopLossUpdate) {
+	updateMessage := fmt.Sprintf("[%s] Stop-Loss: %.2fx → %.2fx | ATH: %.2fx | Price: $%.8f | %s\n",
+		update.Timestamp.Format("2006-01-02 15:04:05"),
+		update.OldMultiplier,
+		update.NewMultiplier,
+		update.ATHMultiplier,
+		update.NewStopLoss,
+		update.Reason,
+	)
+
+	// Get existing stop-loss updates
+	rangeStrUpdatesGet := fmt.Sprintf("%s!P%d", appConfig.SheetName, rowIndex)
+	resp, err := sheetsSvc.Spreadsheets.Values.Get(appConfig.SpreadsheetID, rangeStrUpdatesGet).Do()
+	if err != nil {
+		log.Printf("⚠️ Failed to read existing stop-loss updates: %v", err)
+		return
+	}
+
+	existingUpdates := ""
+	if len(resp.Values) > 0 && len(resp.Values[0]) > 0 {
+		existingUpdates = fmt.Sprintf("%v", resp.Values[0][0])
+	}
+
+	newUpdates := existingUpdates + updateMessage
+	vrUpdates := &sheets.ValueRange{Values: [][]interface{}{{newUpdates}}}
+	_, err = sheetsSvc.Spreadsheets.Values.Update(
+		appConfig.SpreadsheetID, rangeStrUpdatesGet, vrUpdates).ValueInputOption("RAW").Do()
+	if err != nil {
+		log.Printf("⚠️ Failed to append stop-loss update: %v", err)
+	}
 }
