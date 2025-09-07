@@ -1212,7 +1212,7 @@ func getJupiterPrice(tokenAddress string) (float64, float64, error) {
 	log.Printf("⚠️ Quote API failed for %s: %v", tokenAddress, err)
 
 	return getPriceFromAlternativeEndpoints(tokenAddress)
-}}
+}
 
 func getPriceFromQuote(tokenAddress string) (float64, error) {
 	testAmounts := []string{"1000000", "100000", "10000", "1000"}
