@@ -894,18 +894,11 @@ func monitorActiveToken(token TokenMonitoring) {
 	log.Printf("👀 Monitoring: %s (%s) - Current: %.2fx", 
 		token.TokenName, token.TokenAddress[:8], token.CurrentMultiplier)
 
-	// Get current price
-	price, err := getJupiterPrice(token.TokenAddress)
+	// Get current price and market cap (FIX APPLIED HERE)
+	price, currentMarketCap, err := getJupiterPrice(token.TokenAddress)
 	if err != nil {
 		log.Printf("⚠️ Price fetch failed for %s: %v", token.TokenAddress, err)
 		return
-	}
-
-	// Get current market cap
-	_, currentMarketCap, err := getTokenMetadata(token.TokenAddress)
-	if err != nil {
-		log.Printf("⚠️ Market cap fetch failed for %s: %v", token.TokenAddress, err)
-		currentMarketCap = token.CurrentMarketCap // Keep previous value
 	}
 
 	// Track price direction
@@ -927,7 +920,7 @@ func monitorActiveToken(token TokenMonitoring) {
 
 	// Update position
 	token.CurrentPrice = price
-	token.CurrentMarketCap = currentMarketCap
+	token.CurrentMarketCap = currentMarketCap // Now correctly assigned from getJupiterPrice
 	token.LastUpdated = time.Now()
 
 	// Calculate current multiplier from start price
@@ -974,6 +967,7 @@ func monitorActiveToken(token TokenMonitoring) {
 	// Update sheet with current data
 	updateMonitoringData(token)
 }
+
 func logATHAchievement(token TokenMonitoring) {
 	multiplier := token.HighestMultiplier
 	
