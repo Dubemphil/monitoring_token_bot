@@ -1,4 +1,4 @@
-name: 'Deploy Solana Monitor Bot to EC2 with CloudWatch'
+name: 'Deploy Enhanced Solana Monitor with Load Balancing'
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
       - main
 
 env:
-  DOCKER_IMAGE: "solana_monitor_bot"
+  DOCKER_IMAGE: "solana_monitor_bot_enhanced"
   DOCKER_TAG: ${{ github.sha }}
 
 jobs:
@@ -26,7 +26,7 @@ jobs:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-    - name: Build and push Docker image
+    - name: Build and push Enhanced Docker image
       uses: docker/build-push-action@v5
       with:
         context: .
@@ -38,7 +38,7 @@ jobs:
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
-    - name: Deploy Monitor Bot to EC2 with CloudWatch Setup
+    - name: Deploy Enhanced Monitor Bot to EC2
       uses: appleboy/ssh-action@v1.0.0
       with:
         host: ${{ secrets.EC2_HOST }}
@@ -55,7 +55,7 @@ jobs:
             sudo rpm -U ./amazon-cloudwatch-agent.rpm
           fi
 
-          # Create CloudWatch Agent configuration for monitoring bot
+          # Enhanced CloudWatch Agent configuration for load balancing monitoring
           sudo tee /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json > /dev/null <<EOF
           {
             "agent": {
@@ -67,11 +67,32 @@ jobs:
                 "files": {
                   "collect_list": [
                     {
-                      "file_path": "/home/${{ secrets.EC2_USER }}/logs/monitor-current.log",
-                      "log_group_name": "/aws/ec2/solana-monitor-bot",
-                      "log_stream_name": "monitor-bot-{instance_id}",
+                      "file_path": "/home/${{ secrets.EC2_USER }}/logs/enhanced-monitor.log",
+                      "log_group_name": "/aws/ec2/solana-monitor-enhanced",
+                      "log_stream_name": "enhanced-monitor-{instance_id}",
                       "retention_in_days": 14,
                       "multi_line_start_pattern": "^\\[\\d{4}-\\d{2}-\\d{2}",
+                      "timezone": "UTC"
+                    },
+                    {
+                      "file_path": "/home/${{ secrets.EC2_USER }}/logs/rpc-balancer.log",
+                      "log_group_name": "/aws/ec2/solana-monitor-rpc-balancer",
+                      "log_stream_name": "rpc-balancer-{instance_id}",
+                      "retention_in_days": 7,
+                      "timezone": "UTC"
+                    },
+                    {
+                      "file_path": "/home/${{ secrets.EC2_USER }}/logs/webhook-activity.log",
+                      "log_group_name": "/aws/ec2/solana-monitor-webhooks",
+                      "log_stream_name": "webhooks-{instance_id}",
+                      "retention_in_days": 7,
+                      "timezone": "UTC"
+                    },
+                    {
+                      "file_path": "/home/${{ secrets.EC2_USER }}/logs/price-cache.log",
+                      "log_group_name": "/aws/ec2/solana-monitor-cache",
+                      "log_stream_name": "price-cache-{instance_id}",
+                      "retention_in_days": 7,
                       "timezone": "UTC"
                     },
                     {
@@ -80,27 +101,13 @@ jobs:
                       "log_stream_name": "stop-loss-tracking-{instance_id}",
                       "retention_in_days": 30,
                       "timezone": "UTC"
-                    },
-                    {
-                      "file_path": "/home/${{ secrets.EC2_USER }}/logs/ath-alerts.log",
-                      "log_group_name": "/aws/ec2/solana-monitor-ath",
-                      "log_stream_name": "ath-alerts-{instance_id}",
-                      "retention_in_days": 30,
-                      "timezone": "UTC"
-                    },
-                    {
-                      "file_path": "/home/${{ secrets.EC2_USER }}/logs/telegram-calls.log",
-                      "log_group_name": "/aws/ec2/solana-monitor-calls",
-                      "log_stream_name": "telegram-calls-{instance_id}",
-                      "retention_in_days": 90,
-                      "timezone": "UTC"
                     }
                   ]
                 }
               }
             },
             "metrics": {
-              "namespace": "SolanaMonitorBot",
+              "namespace": "SolanaMonitorBotEnhanced",
               "metrics_collected": {
                 "cpu": {
                   "measurement": ["cpu_usage_idle", "cpu_usage_iowait", "cpu_usage_user", "cpu_usage_system"],
@@ -120,7 +127,7 @@ jobs:
           }
           EOF
 
-          # Start CloudWatch Agent with new config
+          # Start CloudWatch Agent with enhanced config
           sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
             -a fetch-config -m ec2 -s \
             -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
@@ -129,13 +136,13 @@ jobs:
           echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login --username "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
 
           # Stop and remove existing container
-          docker stop solana_monitor_bot 2>/dev/null || true
-          docker rm solana_monitor_bot 2>/dev/null || true
+          docker stop solana_monitor_bot_enhanced 2>/dev/null || true
+          docker rm solana_monitor_bot_enhanced 2>/dev/null || true
 
           # Remove old image to force fresh pull
           docker rmi ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE }}:latest 2>/dev/null || true
 
-          # Pull latest image
+          # Pull latest enhanced image
           docker pull ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE }}:latest
 
           # Create credentials.json file from base64
@@ -147,79 +154,93 @@ jobs:
             exit 1
           fi
 
-          # Create logs directory structure for monitoring
+          # Create enhanced logs directory structure
           mkdir -p /home/${{ secrets.EC2_USER }}/logs
-          touch /home/${{ secrets.EC2_USER }}/logs/monitor-current.log
+          touch /home/${{ secrets.EC2_USER }}/logs/enhanced-monitor.log
+          touch /home/${{ secrets.EC2_USER }}/logs/rpc-balancer.log
+          touch /home/${{ secrets.EC2_USER }}/logs/webhook-activity.log
+          touch /home/${{ secrets.EC2_USER }}/logs/price-cache.log
           touch /home/${{ secrets.EC2_USER }}/logs/stop-loss-tracking.log
-          touch /home/${{ secrets.EC2_USER }}/logs/ath-alerts.log
-          touch /home/${{ secrets.EC2_USER }}/logs/telegram-calls.log
 
-          # Run new monitoring container
+          # Run enhanced monitoring container with 24-hour time limits
           docker run -d \
-            --name solana_monitor_bot \
+            --name solana_monitor_bot_enhanced \
             --restart unless-stopped \
             --dns 8.8.8.8 \
             --dns 1.1.1.1 \
+            -p 8080:8080 \
             -e SPREADSHEET_ID="${{ secrets.SPREADSHEET_ID }}" \
             -e SHEET_NAME="SolanaMonitoring" \
-            -e HELIUS_RPC_URL="${{ secrets.HELIUS_RPC_URL }}" \
-            -e TICK_INTERVAL_SECONDS="4" \
+            -e HELIUS_RPC_URLS="${{ secrets.HELIUS_RPC_URL_1 }},${{ secrets.HELIUS_RPC_URL_2 }},${{ secrets.HELIUS_RPC_URL_3 }},${{ secrets.HELIUS_RPC_URL_4 }},${{ secrets.HELIUS_RPC_URL_5 }}" \
+            -e TICK_INTERVAL_SECONDS="8" \
+            -e MONITORING_DURATION_HOURS="24" \
             -e USDC_TOKEN_ADDRESS="${{ secrets.USDC_TOKEN_ADDRESS }}" \
             -e SLIPPAGE_BPS="100" \
+            -e RATE_LIMIT_MS="200" \
+            -e WEBHOOK_PORT="8080" \
+            -e ENABLE_WEBHOOKS="true" \
             -e ENABLE_DETAILED_LOGGING="true" \
             -v /home/${{ secrets.EC2_USER }}/credentials.json:/app/credentials.json:ro \
             -v /home/${{ secrets.EC2_USER }}/logs:/app/logs \
             ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE }}:latest
 
-          # Wait for container to start
-          sleep 15
+          # Wait for enhanced container to start
+          sleep 20
 
           # Show container status
-          if docker ps | grep -q solana_monitor_bot; then
-            echo "✅ Monitor container is running"
-            docker logs solana_monitor_bot --tail 20
+          if docker ps | grep -q solana_monitor_bot_enhanced; then
+            echo "✅ Enhanced Monitor container is running"
+            docker logs solana_monitor_bot_enhanced --tail 30
             
-            # Set up specialized log monitoring script for tracking
-            cat > /home/${{ secrets.EC2_USER }}/monitor_tracking.sh << 'MONITOR_EOF'
+            # Test webhook endpoint
+            curl -f http://localhost:8080/health || echo "⚠️ Webhook endpoint not responding yet"
+            
+            # Set up enhanced log monitoring script
+            cat > /home/${{ secrets.EC2_USER }}/enhanced_monitor_tracking.sh << 'ENHANCED_EOF'
           #!/bin/bash
           
-          # Monitor bot logs and extract key information for tracking
-          docker logs solana_monitor_bot --follow --tail 0 2>&1 | while read line; do
-            echo "$line" >> /home/${{ secrets.EC2_USER }}/logs/monitor-current.log
+          # Enhanced monitoring script for load balancing and webhook tracking
+          docker logs solana_monitor_bot_enhanced --follow --tail 0 2>&1 | while read line; do
+            echo "$line" >> /home/${{ secrets.EC2_USER }}/logs/enhanced-monitor.log
             
-            # Extract stop-loss tracking updates
-            if echo "$line" | grep -q "TRAILING STOP-LOSS\|🛡️.*STOP-LOSS UPDATE\|Stop-Loss.*→"; then
+            # Track RPC load balancing
+            if echo "$line" | grep -q "RPC.*balancer\|RPC.*endpoint\|rate.*limit\|RPC.*switch"; then
+              echo "$(date '+%Y-%m-%d %H:%M:%S') $line" >> /home/${{ secrets.EC2_USER }}/logs/rpc-balancer.log
+            fi
+            
+            # Track webhook activity
+            if echo "$line" | grep -q "Webhook\|📡.*price\|🔄.*cached\|webhook.*update"; then
+              echo "$(date '+%Y-%m-%d %H:%M:%S') $line" >> /home/${{ secrets.EC2_USER }}/logs/webhook-activity.log
+            fi
+            
+            # Track price cache performance
+            if echo "$line" | grep -q "cached.*price\|price.*cache\|cache.*hit\|cache.*miss"; then
+              echo "$(date '+%Y-%m-%d %H:%M:%S') $line" >> /home/${{ secrets.EC2_USER }}/logs/price-cache.log
+            fi
+            
+            # Track stop-loss updates (enhanced)
+            if echo "$line" | grep -q "TRAILING STOP-LOSS\|🛡️.*STOP-LOSS\|Stop-Loss.*→\|STOP-LOSS TRIGGERED"; then
               echo "$(date '+%Y-%m-%d %H:%M:%S') $line" >> /home/${{ secrets.EC2_USER }}/logs/stop-loss-tracking.log
             fi
             
-            # Extract ATH alerts
-            if echo "$line" | grep -q "NEW ATH\|MAJOR ATH\|ATH.*🚀\|ATH.*🔥"; then
-              echo "$(date '+%Y-%m-%d %H:%M:%S') $line" >> /home/${{ secrets.EC2_USER }}/logs/ath-alerts.log
-            fi
-            
-            # Extract telegram call monitoring
-            if echo "$line" | grep -q "MONITORING STARTED\|Starting to monitor\|New token detected"; then
-              echo "$(date '+%Y-%m-%d %H:%M:%S') $line" >> /home/${{ secrets.EC2_USER }}/logs/telegram-calls.log
-            fi
-            
-            # Extract triggered alerts (even though we don't sell)
-            if echo "$line" | grep -q "STOP-LOSS TRIGGERED\|🛑.*TRIGGERED"; then
-              echo "$(date '+%Y-%m-%d %H:%M:%S') ALERT: $line" >> /home/${{ secrets.EC2_USER }}/logs/stop-loss-tracking.log
+            # Track API rate limiting issues
+            if echo "$line" | grep -q "rate.*limited\|429.*error\|too.*many.*requests"; then
+              echo "$(date '+%Y-%m-%d %H:%M:%S') RATE LIMIT: $line" >> /home/${{ secrets.EC2_USER }}/logs/rpc-balancer.log
             fi
           done &
-          MONITOR_EOF
+          ENHANCED_EOF
             
-            chmod +x /home/${{ secrets.EC2_USER }}/monitor_tracking.sh
-            nohup /home/${{ secrets.EC2_USER }}/monitor_tracking.sh > /dev/null 2>&1 &
+            chmod +x /home/${{ secrets.EC2_USER }}/enhanced_monitor_tracking.sh
+            nohup /home/${{ secrets.EC2_USER }}/enhanced_monitor_tracking.sh > /dev/null 2>&1 &
             
           else
-            echo "❌ Monitor container failed to start"
-            docker logs solana_monitor_bot --tail 50 || true
+            echo "❌ Enhanced Monitor container failed to start"
+            docker logs solana_monitor_bot_enhanced --tail 50 || true
             exit 1
           fi
 
-          # Create specialized CloudWatch dashboard for monitoring
-          aws cloudwatch put-dashboard --region ${{ secrets.AWS_REGION || 'us-east-1' }} --dashboard-name "SolanaMonitorBot" --dashboard-body '{
+          # Create enhanced CloudWatch dashboard for load balancing monitoring
+          aws cloudwatch put-dashboard --region ${{ secrets.AWS_REGION || 'us-east-1' }} --dashboard-name "SolanaMonitorBotEnhanced" --dashboard-body '{
             "widgets": [
               {
                 "type": "log",
@@ -228,9 +249,9 @@ jobs:
                 "width": 8,
                 "height": 6,
                 "properties": {
-                  "query": "SOURCE \"/aws/ec2/solana-monitor-stoploss\" | fields @timestamp, @message\n| filter @message like /TRAILING STOP-LOSS/\n| sort @timestamp desc\n| limit 50",
+                  "query": "SOURCE \"/aws/ec2/solana-monitor-rpc-balancer\" | fields @timestamp, @message\n| filter @message like /RPC.*balancer/ or @message like /rate.*limit/\n| sort @timestamp desc\n| limit 50",
                   "region": "${{ secrets.AWS_REGION || 'us-east-1' }}",
-                  "title": "Trailing Stop-Loss Updates",
+                  "title": "RPC Load Balancer Activity",
                   "view": "table"
                 }
               },
@@ -241,9 +262,9 @@ jobs:
                 "width": 8,
                 "height": 6,
                 "properties": {
-                  "query": "SOURCE \"/aws/ec2/solana-monitor-ath\" | fields @timestamp, @message\n| filter @message like /ATH/\n| sort @timestamp desc\n| limit 30",
+                  "query": "SOURCE \"/aws/ec2/solana-monitor-webhooks\" | fields @timestamp, @message\n| filter @message like /Webhook/ or @message like /📡/\n| sort @timestamp desc\n| limit 30",
                   "region": "${{ secrets.AWS_REGION || 'us-east-1' }}",
-                  "title": "All-Time High Alerts",
+                  "title": "Webhook Price Updates",
                   "view": "table"
                 }
               },
@@ -254,9 +275,9 @@ jobs:
                 "width": 8,
                 "height": 6,
                 "properties": {
-                  "query": "SOURCE \"/aws/ec2/solana-monitor-calls\" | fields @timestamp, @message\n| filter @message like /MONITORING STARTED/\n| sort @timestamp desc\n| limit 20",
+                  "query": "SOURCE \"/aws/ec2/solana-monitor-cache\" | fields @timestamp, @message\n| filter @message like /cached.*price/ or @message like /🔄/\n| sort @timestamp desc\n| limit 20",
                   "region": "${{ secrets.AWS_REGION || 'us-east-1' }}",
-                  "title": "New Telegram Calls",
+                  "title": "Price Cache Performance",
                   "view": "table"
                 }
               },
@@ -264,22 +285,48 @@ jobs:
                 "type": "log",
                 "x": 0,
                 "y": 6,
-                "width": 24,
+                "width": 12,
                 "height": 6,
                 "properties": {
-                  "query": "SOURCE \"/aws/ec2/solana-monitor-stoploss\" | fields @timestamp, @message\n| filter @message like /TRIGGERED/\n| sort @timestamp desc\n| limit 10",
+                  "query": "SOURCE \"/aws/ec2/solana-monitor-stoploss\" | fields @timestamp, @message\n| filter @message like /TRAILING STOP-LOSS/ or @message like /TRIGGERED/\n| sort @timestamp desc\n| limit 15",
                   "region": "${{ secrets.AWS_REGION || 'us-east-1' }}",
-                  "title": "Stop-Loss Triggered Alerts (Monitoring Only)",
+                  "title": "Enhanced Stop-Loss Tracking",
+                  "view": "table"
+                }
+              },
+              {
+                "type": "log",
+                "x": 12,
+                "y": 6,
+                "width": 12,
+                "height": 6,
+                "properties": {
+                  "query": "SOURCE \"/aws/ec2/solana-monitor-enhanced\" | fields @timestamp, @message\n| filter @message like /Enhanced monitoring/ or @message like /📊.*Monitoring/\n| sort @timestamp desc\n| limit 10",
+                  "region": "${{ secrets.AWS_REGION || 'us-east-1' }}",
+                  "title": "Enhanced Monitoring Status",
                   "view": "table"
                 }
               }
             ]
-          }' || echo "Warning: Could not create CloudWatch dashboard (check AWS permissions)"
+          }' || echo "Warning: Could not create enhanced CloudWatch dashboard (check AWS permissions)"
 
-          # Save deployment logs
-          docker logs solana_monitor_bot --tail 100 > /home/${{ secrets.EC2_USER }}/logs/monitor-logs-$TIMESTAMP.txt 2>&1 || true
+          # Save enhanced deployment logs
+          docker logs solana_monitor_bot_enhanced --tail 100 > /home/${{ secrets.EC2_USER }}/logs/enhanced-deploy-$TIMESTAMP.txt 2>&1 || true
+          
+          # Test webhook health endpoint
+          sleep 5
+          if curl -s http://localhost:8080/health | jq '.status' | grep -q "healthy"; then
+            echo "✅ Webhook health check passed"
+          else
+            echo "⚠️ Webhook health check failed - but continuing deployment"
+          fi
           
           # Logout from Docker Hub
           docker logout
 
-          echo "✅ Solana Monitor Bot deployment complete with CloudWatch tracking enabled"
+          echo "✅ Enhanced Solana Monitor Bot deployment complete with:"
+          echo "   - RPC Load Balancing across 5 endpoints"
+          echo "   - Webhook price caching system"
+          echo "   - Enhanced CloudWatch monitoring"
+          echo "   - Rate limiting protection"
+          echo "   - Optimized for 50+ token monitoring"

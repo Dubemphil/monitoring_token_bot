@@ -1,4 +1,4 @@
-// main.go - Solana Token Monitoring Bot for Telegram Calls.
+// Enhanced main.go with Webhooks and RPC Load Balancing
 package main
 
 import (
@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gagliardetto/solana-go/rpc"
@@ -19,123 +20,119 @@ import (
 	"google.golang.org/api/sheets/v4"
 )
 
-// --- Configuration Structs ---
-
+// --- Enhanced Configuration ---
 type Config struct {
 	SpreadsheetID       string
 	SheetName           string
-	HeliusRPCURL        string
+	HeliusRPCURLs       []string // Multiple RPC URLs for load balancing
 	TickIntervalSeconds int
 	USDCTokenAddress    string
 	SlippageBps         int
+	WebhookPort         string
+	EnableWebhooks      bool
+	RateLimitDelay      time.Duration
 }
 
-// --- Data Structs ---
-
-type TokenMonitoring struct {
-	RowIndex              int
-	TokenAddress          string
-	TokenName             string
-	Status                string
-	MonitorStartPrice     float64 // Price when monitoring started
-	CurrentPrice          float64
-	MonitorStartMarketCap float64
-	CurrentMarketCap      float64
-	HighestPrice          float64
-	HighestMarketCap      float64
-	HighestMultiplier     float64 // Highest multiplier from start price
-	CurrentMultiplier     float64 // Current multiplier from start price
-	TrailingStopLoss      float64
-	StopLossMultiplier    float64
-	LastUpdated           time.Time
-	// Tracking fields
-	ConsecutiveDownticks  int
-	LastPriceDirection    string
-	StopLossHistory       []StopLossUpdate // Track stop-loss movements
-	CallSource            string           // Which telegram channel/source
-	CallTime              time.Time        // When the call was made
+// --- RPC Load Balancer ---
+type RPCLoadBalancer struct {
+	urls         []string
+	clients      []*rpc.Client
+	currentIndex int
+	mutex        sync.RWMutex
+	rateLimiter  map[int]time.Time
 }
 
-type StopLossUpdate struct {
-	Timestamp     time.Time
-	OldStopLoss   float64
-	NewStopLoss   float64
-	OldMultiplier float64
-	NewMultiplier float64
-	ATHMultiplier float64
-	Reason        string
+func NewRPCLoadBalancer(urls []string) *RPCLoadBalancer {
+	clients := make([]*rpc.Client, len(urls))
+	for i, url := range urls {
+		clients[i] = rpc.New(url)
+	}
+	
+	return &RPCLoadBalancer{
+		urls:        urls,
+		clients:     clients,
+		rateLimiter: make(map[int]time.Time),
+	}
 }
 
-// --- Token Metadata Structs ---
-
-type DexScreenerPair struct {
-	ChainId     string `json:"chainId"`
-	DexId       string `json:"dexId"`
-	Url         string `json:"url"`
-	PairAddress string `json:"pairAddress"`
-	BaseToken   struct {
-		Address string `json:"address"`
-		Name    string `json:"name"`
-		Symbol  string `json:"symbol"`
-	} `json:"baseToken"`
-	QuoteToken struct {
-		Address string `json:"address"`
-		Name    string `json:"name"`
-		Symbol  string `json:"symbol"`
-	} `json:"quoteToken"`
-	PriceNative string  `json:"priceNative"`
-	PriceUsd    string  `json:"priceUsd"`
-	Liquidity   struct {
-		Usd   float64 `json:"usd"`
-		Base  float64 `json:"base"`
-		Quote float64 `json:"quote"`
-	} `json:"liquidity"`
-	Fdv       float64 `json:"fdv"`
-	MarketCap float64 `json:"marketCap"`
+func (lb *RPCLoadBalancer) GetNextClient() *rpc.Client {
+	lb.mutex.Lock()
+	defer lb.mutex.Unlock()
+	
+	startIndex := lb.currentIndex
+	
+	for {
+		// Check if this RPC is rate limited
+		if lastUsed, exists := lb.rateLimiter[lb.currentIndex]; exists {
+			if time.Since(lastUsed) < appConfig.RateLimitDelay {
+				lb.currentIndex = (lb.currentIndex + 1) % len(lb.clients)
+				if lb.currentIndex == startIndex {
+					// All RPCs are rate limited, wait for the oldest one
+					time.Sleep(100 * time.Millisecond)
+				}
+				continue
+			}
+		}
+		
+		// Use this client and mark it as used
+		client := lb.clients[lb.currentIndex]
+		lb.rateLimiter[lb.currentIndex] = time.Now()
+		lb.currentIndex = (lb.currentIndex + 1) % len(lb.clients)
+		
+		return client
+	}
 }
 
-type DexScreenerResponse struct {
-	SchemaVersion string            `json:"schemaVersion"`
-	Pairs         []DexScreenerPair `json:"pairs"`
+// --- Webhook Data Structures ---
+type WebhookPriceUpdate struct {
+	TokenAddress string    `json:"token_address"`
+	Price        float64   `json:"price"`
+	MarketCap    float64   `json:"market_cap"`
+	Timestamp    time.Time `json:"timestamp"`
+	Source       string    `json:"source"`
 }
 
-// --- Jupiter API Structs ---
-
-type JupiterQuoteResponse struct {
-	InputMint            string      `json:"inputMint"`
-	InAmount             string      `json:"inAmount"`
-	OutputMint           string      `json:"outputMint"`
-	OutAmount            string      `json:"outAmount"`
-	OtherAmountThreshold string      `json:"otherAmountThreshold"`
-	SwapMode             string      `json:"swapMode"`
-	SlippageBps          int         `json:"slippageBps"`
-	PlatformFee          interface{} `json:"platformFee"`
-	PriceImpactPct       string      `json:"priceImpactPct"`
-	RoutePlan            []RoutePlan `json:"routePlan"`
-	ContextSlot          int64       `json:"contextSlot"`
-	TimeTaken            float64     `json:"timeTaken"`
+type PriceCache struct {
+	mu     sync.RWMutex
+	prices map[string]*WebhookPriceUpdate
 }
 
-type SwapInfo struct {
-	AmmKey     string `json:"ammKey"`
-	Label      string `json:"label"`
-	InputMint  string `json:"inputMint"`
-	OutputMint string `json:"outputMint"`
-	InAmount   string `json:"inAmount"`
-	OutAmount  string `json:"outAmount"`
-	FeeAmount  string `json:"feeAmount"`
-	FeeMint    string `json:"feeMint"`
+func NewPriceCache() *PriceCache {
+	return &PriceCache{
+		prices: make(map[string]*WebhookPriceUpdate),
+	}
 }
 
-type RoutePlan struct {
-	SwapInfo SwapInfo `json:"swapInfo"`
-	Percent  int      `json:"percent"`
+func (pc *PriceCache) Set(tokenAddress string, update *WebhookPriceUpdate) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	pc.prices[tokenAddress] = update
 }
 
-// Global clients for reuse
-var sheetsSvc *sheets.Service
-var solanaClient *rpc.Client
-var appConfig Config
+func (pc *PriceCache) Get(tokenAddress string) (*WebhookPriceUpdate, bool) {
+	pc.mu.RLock()
+	defer pc.mu.RUnlock()
+	update, exists := pc.prices[tokenAddress]
+	return update, exists
+}
+
+func (pc *PriceCache) IsStale(tokenAddress string, maxAge time.Duration) bool {
+	pc.mu.RLock()
+	defer pc.mu.RUnlock()
+	if update, exists := pc.prices[tokenAddress]; exists {
+		return time.Since(update.Timestamp) > maxAge
+	}
+	return true
+}
+
+// --- Global Variables ---
+var (
+	sheetsSvc     *sheets.Service
+	rpcBalancer   *RPCLoadBalancer
+	priceCache    *PriceCache
+	appConfig     Config
+	httpClient    = &http.Client{Timeout: 10 * time.Second}
+)
 
 var jupiterEndpoints = struct {
 	QuoteV1 string
@@ -143,49 +140,10 @@ var jupiterEndpoints = struct {
 	QuoteV1: "https://lite-api.jup.ag/swap/v1/quote",
 }
 
-func main() {
-	log.Println("🚀 Starting Solana Token Monitoring Bot for Telegram Calls...")
-
-	// 1. Load Configuration
-	if err := loadConfig(); err != nil {
-		log.Fatalf("❌ Configuration error: %v", err)
-	}
-
-	// 2. Test Jupiter API connectivity
-	if err := testJupiterAPI(); err != nil {
-		log.Fatalf("❌ Jupiter API connectivity error: %v", err)
-	}
-
-	// 3. Test network connectivity
-	if err := testNetworkConnectivity(); err != nil {
-		log.Fatalf("❌ Network connectivity error: %v", err)
-	}
-
-	// 4. Initialize Services
-	if err := initializeServices(); err != nil {
-		log.Fatalf("❌ Service initialization error: %v", err)
-	}
-
-	// 5. Create sheet headers if needed
-	if err := ensureSheetHeaders(); err != nil {
-		log.Printf("⚠️ Warning: Could not ensure sheet headers: %v", err)
-	}
-
-	// 6. Start Main Monitoring Loop
-	log.Printf("🔄 Starting monitoring loop (%d seconds interval)...", appConfig.TickIntervalSeconds)
-	ticker := time.NewTicker(time.Duration(appConfig.TickIntervalSeconds) * time.Second)
-	defer ticker.Stop()
-
-	for {
-		monitorTokens()
-		<-ticker.C
-	}
-}
-
+// --- Enhanced Configuration Loading ---
 func loadConfig() error {
-	log.Println("Loading configuration from environment variables...")
-	var err error
-
+	log.Println("Loading enhanced configuration...")
+	
 	getRequiredEnv := func(key string) (string, error) {
 		value := os.Getenv(key)
 		if value == "" {
@@ -194,28 +152,50 @@ func loadConfig() error {
 		return value, nil
 	}
 
-	// Load string values
+	var err error
 	appConfig.SpreadsheetID, err = getRequiredEnv("SPREADSHEET_ID")
 	if err != nil {
 		return err
 	}
+	
 	appConfig.SheetName, err = getRequiredEnv("SHEET_NAME")
 	if err != nil {
 		return err
 	}
-	appConfig.HeliusRPCURL, err = getRequiredEnv("HELIUS_RPC_URL")
-	if err != nil {
-		return err
-	}
+	
 	appConfig.USDCTokenAddress, err = getRequiredEnv("USDC_TOKEN_ADDRESS")
 	if err != nil {
 		return err
 	}
 
-	// Load integer values with defaults
+	// Load multiple RPC URLs
+	rpcUrls := os.Getenv("HELIUS_RPC_URLS")
+	if rpcUrls == "" {
+		// Fallback to single URL for backward compatibility
+		singleURL, err := getRequiredEnv("HELIUS_RPC_URL")
+		if err != nil {
+			return err
+		}
+		appConfig.HeliusRPCURLs = []string{singleURL}
+	} else {
+		appConfig.HeliusRPCURLs = strings.Split(rpcUrls, ",")
+		for i, url := range appConfig.HeliusRPCURLs {
+			appConfig.HeliusRPCURLs[i] = strings.TrimSpace(url)
+		}
+	}
+
+	// Webhook configuration
+	appConfig.WebhookPort = os.Getenv("WEBHOOK_PORT")
+	if appConfig.WebhookPort == "" {
+		appConfig.WebhookPort = "8080"
+	}
+	
+	appConfig.EnableWebhooks = os.Getenv("ENABLE_WEBHOOKS") == "true"
+
+	// Timing configuration
 	tickIntervalStr := os.Getenv("TICK_INTERVAL_SECONDS")
 	if tickIntervalStr == "" {
-		appConfig.TickIntervalSeconds = 10 // Default to 10 seconds for monitoring
+		appConfig.TickIntervalSeconds = 8 // Slower interval to reduce API pressure
 	} else {
 		appConfig.TickIntervalSeconds, err = strconv.Atoi(tickIntervalStr)
 		if err != nil {
@@ -223,9 +203,21 @@ func loadConfig() error {
 		}
 	}
 
+	// Rate limiting
+	rateLimitMs := os.Getenv("RATE_LIMIT_MS")
+	if rateLimitMs == "" {
+		appConfig.RateLimitDelay = 200 * time.Millisecond // 200ms between RPC calls
+	} else {
+		ms, err := strconv.Atoi(rateLimitMs)
+		if err != nil {
+			return fmt.Errorf("invalid RATE_LIMIT_MS: %v", err)
+		}
+		appConfig.RateLimitDelay = time.Duration(ms) * time.Millisecond
+	}
+
 	slippageBpsStr := os.Getenv("SLIPPAGE_BPS")
 	if slippageBpsStr == "" {
-		appConfig.SlippageBps = 100 // Default to 1% slippage for price quotes
+		appConfig.SlippageBps = 100
 	} else {
 		appConfig.SlippageBps, err = strconv.Atoi(slippageBpsStr)
 		if err != nil {
@@ -233,213 +225,415 @@ func loadConfig() error {
 		}
 	}
 
-	log.Printf("✅ Configuration loaded successfully. Tick Interval: %ds", appConfig.TickIntervalSeconds)
+	log.Printf("✅ Enhanced configuration loaded: %d RPCs, Webhooks: %t, Tick: %ds", 
+		len(appConfig.HeliusRPCURLs), appConfig.EnableWebhooks, appConfig.TickIntervalSeconds)
 	return nil
 }
 
-func initializeServices() error {
-	ctx := context.Background()
-	var err error
-
-	sheetsSvc, err = sheets.NewService(ctx,
-		option.WithCredentialsFile("credentials.json"),
-		option.WithScopes(sheets.SpreadsheetsScope))
-	if err != nil {
-		return fmt.Errorf("unable to retrieve Sheets client: %v", err)
+// --- Enhanced Price Fetching ---
+func getEnhancedTokenPrice(tokenAddress string) (float64, float64, error) {
+	// Try webhook cache first (if enabled and fresh)
+	if appConfig.EnableWebhooks {
+		if update, exists := priceCache.Get(tokenAddress); exists {
+			if !priceCache.IsStale(tokenAddress, 30*time.Second) {
+				log.Printf("🔄 Using cached price for %s: $%.8f", tokenAddress[:8], update.Price)
+				return update.Price, update.MarketCap, nil
+			}
+		}
 	}
 
-	solanaClient = rpc.New(appConfig.HeliusRPCURL)
-	log.Println("✅ Services initialized successfully.")
-	return nil
+	// Fallback to Jupiter API with load balancing
+	return getJupiterPriceWithBalancer(tokenAddress)
 }
 
-func testJupiterAPI() error {
-	log.Println("🧪 Testing Jupiter API connectivity...")
-
-	solAddress := "So11111111111111111111111111111111111111112"
-	testAmount := "100000000" // 0.1 SOL in lamports
-
-	url := fmt.Sprintf("%s?inputMint=%s&outputMint=%s&amount=%s&slippageBps=50&restrictIntermediateTokens=true",
-		jupiterEndpoints.QuoteV1,
-		solAddress,
-		appConfig.USDCTokenAddress,
-		testAmount,
-	)
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(url)
+func getJupiterPriceWithBalancer(tokenAddress string) (float64, float64, error) {
+	// Add delay to prevent rate limiting
+	time.Sleep(appConfig.RateLimitDelay)
+	
+	price, err := getPriceFromQuoteBalanced(tokenAddress)
 	if err != nil {
+		log.Printf("⚠️ Quote API failed for %s: %v", tokenAddress[:8], err)
+		return getPriceFromAlternativeEndpoints(tokenAddress)
+	}
+
+	// Get market cap from DexScreener
+	_, marketCap, metaErr := getTokenMetadata(tokenAddress)
+	if metaErr != nil {
+		log.Printf("⚠️ Market cap fetch failed for %s: %v", tokenAddress[:8], metaErr)
+		marketCap = 0 // Use 0 if we can't get market cap
+	}
+
+	return price, marketCap, nil
+}
+
+func getPriceFromQuoteBalanced(tokenAddress string) (float64, error) {
+	testAmounts := []string{"1000000", "100000", "10000", "1000"}
+
+	for i, testAmount := range testAmounts {
+		url := fmt.Sprintf("%s?inputMint=%s&outputMint=%s&amount=%s&slippageBps=%d&restrictIntermediateTokens=true",
+			jupiterEndpoints.QuoteV1,
+			tokenAddress,
+			appConfig.USDCTokenAddress,
+			testAmount,
+			appConfig.SlippageBps,
+		)
+
+		resp, err := httpClient.Get(url)
+		if err != nil {
+			if i == len(testAmounts)-1 {
+				return 0, fmt.Errorf("quote request failed: %v", err)
+			}
+			continue
+		}
+		defer resp.Body.Close()
+
+		// Handle rate limiting
+		if resp.StatusCode == 429 {
+			log.Printf("⏳ Rate limited, waiting...")
+			time.Sleep(1 * time.Second)
+			if i == len(testAmounts)-1 {
+				return 0, fmt.Errorf("rate limited on all attempts")
+			}
+			continue
+		}
+
+		if resp.StatusCode != 200 {
+			body, _ := ioutil.ReadAll(resp.Body)
+			if i == len(testAmounts)-1 {
+				return 0, fmt.Errorf("quote failed with status %d: %s", resp.StatusCode, string(body))
+			}
+			continue
+		}
+
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			if i == len(testAmounts)-1 {
+				return 0, fmt.Errorf("failed to read response: %v", err)
+			}
+			continue
+		}
+
+		var quote JupiterQuoteResponse
+		if err := json.Unmarshal(body, &quote); err != nil {
+			if i == len(testAmounts)-1 {
+				return 0, fmt.Errorf("failed to parse quote: %v", err)
+			}
+			continue
+		}
+
+		inAmount, err := strconv.ParseFloat(quote.InAmount, 64)
+		if err != nil {
+			continue
+		}
+
+		outAmount, err := strconv.ParseFloat(quote.OutAmount, 64)
+		if err != nil {
+			continue
+		}
+
+		if inAmount == 0 {
+			continue
+		}
+
+		price := outAmount / inAmount
+		if price < 0.000001 && price > 0 {
+			price = price * 1000000
+		}
+
+		if price > 0 {
+			return price, nil
+		}
+	}
+
+	return 0, fmt.Errorf("could not get valid price with any test amount")
+}
+
+// --- Webhook Server ---
+func startWebhookServer() {
+	if !appConfig.EnableWebhooks {
+		return
+	}
+
+	http.HandleFunc("/webhook/price", handlePriceWebhook)
+	http.HandleFunc("/health", handleHealthCheck)
+	
+	server := &http.Server{
+		Addr:    ":" + appConfig.WebhookPort,
+		Handler: nil,
+	}
+
+	go func() {
+		log.Printf("🌐 Starting webhook server on port %s", appConfig.WebhookPort)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("⚠️ Webhook server error: %v", err)
+		}
+	}()
+}
+
+func handlePriceWebhook(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read body", http.StatusBadRequest)
+		return
+	}
+
+	var update WebhookPriceUpdate
+	if err := json.Unmarshal(body, &update); err != nil {
+		http.Error(w, "Failed to parse JSON", http.StatusBadRequest)
+		return
+	}
+
+	update.Timestamp = time.Now()
+	priceCache.Set(update.TokenAddress, &update)
+	
+	log.Printf("📡 Webhook price update: %s = $%.8f", update.TokenAddress[:8], update.Price)
+	
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
+
+func handleHealthCheck(w http.ResponseWriter, r *http.Request) {
+	status := map[string]interface{}{
+		"status":    "healthy",
+		"timestamp": time.Now(),
+		"rpc_urls":  len(appConfig.HeliusRPCURLs),
+		"webhooks":  appConfig.EnableWebhooks,
+		"cache_size": len(priceCache.prices),
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
+}
+
+// --- Enhanced Monitoring ---
+func monitorActiveTokenEnhanced(token TokenMonitoring) {
+	log.Printf("👀 Enhanced monitoring: %s (%s) - Current: %.2fx", 
+		token.TokenName, token.TokenAddress[:8], token.CurrentMultiplier)
+
+	// Get current price and market cap with enhanced method
+	price, currentMarketCap, err := getEnhancedTokenPrice(token.TokenAddress)
+	if err != nil {
+		log.Printf("⚠️ Price fetch failed for %s: %v", token.TokenAddress[:8], err)
+		return
+	}
+
+	// Track price direction
+	previousPrice := token.CurrentPrice
+	previousMultiplier := token.CurrentMultiplier
+	priceDirection := "STABLE"
+	if price > previousPrice {
+		priceDirection = "UP"
+		token.ConsecutiveDownticks = 0
+	} else if price < previousPrice {
+		priceDirection = "DOWN"
+		if token.LastPriceDirection == "DOWN" {
+			token.ConsecutiveDownticks++
+		} else {
+			token.ConsecutiveDownticks = 1
+		}
+	}
+	token.LastPriceDirection = priceDirection
+
+	// Update position
+	token.CurrentPrice = price
+	token.CurrentMarketCap = currentMarketCap
+	token.LastUpdated = time.Now()
+
+	// Calculate current multiplier from start price
+	if token.MonitorStartPrice > 0 {
+		token.CurrentMultiplier = token.CurrentPrice / token.MonitorStartPrice
+	}
+
+	// Update highest price and market cap
+	isNewATH := false
+	if token.CurrentPrice > token.HighestPrice {
+		token.HighestPrice = token.CurrentPrice
+		token.HighestMarketCap = currentMarketCap
+		token.HighestMultiplier = token.CurrentMultiplier
+		isNewATH = true
+		logATHAchievement(token)
+	}
+
+	// Calculate and update trailing stop-loss
+	oldStopLoss := token.TrailingStopLoss
+	oldStopMultiplier := token.StopLossMultiplier
+	newStopLoss, newStopMultiplier := calculateTrailingStopLoss(token)
+
+	// Log multiplier milestones
+	logMultiplierMilestones(token, previousMultiplier, token.CurrentMultiplier)
+
+	// Track stop-loss updates
+	if newStopLoss != oldStopLoss || newStopMultiplier != oldStopMultiplier {
+		handleStopLossUpdate(token, oldStopLoss, newStopLoss, oldStopMultiplier, newStopMultiplier, isNewATH)
+	}
+
+	token.TrailingStopLoss = newStopLoss
+	token.StopLossMultiplier = newStopMultiplier
+
+	// Enhanced stop-loss trigger logging
+	if token.TrailingStopLoss > 0 && token.CurrentPrice <= token.TrailingStopLoss {
+		percentDrop := ((token.HighestMultiplier - token.CurrentMultiplier) / token.HighestMultiplier) * 100
+		updateStatusAndLog(token.RowIndex, "STOP-LOSS TRIGGERED",
+			"🛑 STOP-LOSS TRIGGERED! %s | Current: %.2fx | Stop: %.2fx | Peak was: %.2fx | Dropped %.1f%% from peak | MC: $%.0f",
+			token.TokenName, token.CurrentMultiplier, token.StopLossMultiplier, token.HighestMultiplier, percentDrop, token.CurrentMarketCap)
+	}
+
+	// Update sheet with current data
+	updateMonitoringData(token)
+}
+
+// --- Enhanced Main Function ---
+func main() {
+	log.Println("🚀 Starting Enhanced Solana Token Monitoring Bot...")
+
+	// Load enhanced configuration
+	if err := loadConfig(); err != nil {
+		log.Fatalf("❌ Configuration error: %v", err)
+	}
+
+	// Initialize RPC load balancer
+	rpcBalancer = NewRPCLoadBalancer(appConfig.HeliusRPCURLs)
+	log.Printf("✅ RPC Load Balancer initialized with %d endpoints", len(appConfig.HeliusRPCURLs))
+
+	// Initialize price cache
+	priceCache = NewPriceCache()
+
+	// Test connectivity
+	if err := testEnhancedConnectivity(); err != nil {
+		log.Fatalf("❌ Connectivity test failed: %v", err)
+	}
+
+	// Initialize services
+	if err := initializeServices(); err != nil {
+		log.Fatalf("❌ Service initialization error: %v", err)
+	}
+
+	// Start webhook server
+	startWebhookServer()
+
+	// Create sheet headers
+	if err := ensureSheetHeaders(); err != nil {
+		log.Printf("⚠️ Warning: Could not ensure sheet headers: %v", err)
+	}
+
+	// Start monitoring loop with enhanced interval
+	log.Printf("🔄 Starting enhanced monitoring loop (%d seconds interval)...", appConfig.TickIntervalSeconds)
+	ticker := time.NewTicker(time.Duration(appConfig.TickIntervalSeconds) * time.Second)
+	defer ticker.Stop()
+
+	for {
+		monitorTokensEnhanced()
+		<-ticker.C
+	}
+}
+
+func testEnhancedConnectivity() error {
+	log.Println("🧪 Testing enhanced connectivity...")
+
+	// Test all RPC endpoints
+	for i, url := range appConfig.HeliusRPCURLs {
+		log.Printf("Testing RPC %d: %s", i+1, url[:50]+"...")
+		// You can add specific RPC tests here
+	}
+
+	// Test Jupiter API
+	if err := testJupiterAPI(); err != nil {
 		return fmt.Errorf("Jupiter API test failed: %v", err)
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		body, _ := ioutil.ReadAll(resp.Body)
-		return fmt.Errorf("Jupiter API returned status %d: %s", resp.StatusCode, string(body))
-	}
-
-	log.Println("✅ Jupiter API connectivity test passed!")
+	log.Println("✅ Enhanced connectivity test passed")
 	return nil
 }
 
-func testNetworkConnectivity() error {
-	log.Println("🔍 Testing network connectivity...")
-
-	testURLs := []string{
-		"https://google.com",
-		"https://api.mainnet-beta.solana.com",
-		"https://lite-api.jup.ag",
-		"https://api.dexscreener.com",
-	}
-
-	client := &http.Client{Timeout: 10 * time.Second}
-
-	for _, url := range testURLs {
-		resp, err := client.Get(url)
-		if err != nil {
-			log.Printf("❌ Failed to reach %s: %v", url, err)
-			return fmt.Errorf("network connectivity issue: %v", err)
-		}
-		resp.Body.Close()
-		log.Printf("✅ Successfully reached %s", url)
-	}
-
-	log.Println("✅ Network connectivity test passed")
-	return nil
-}
-
-func ensureSheetHeaders() error {
-	headers := []interface{}{
-		"Token Address", "Token Name", "Status", "Call Source", "Call Time", 
-		"Start Price", "Current Price", "Start Market Cap", "Current Market Cap", 
-		"Highest Market Cap", "Peak Multiplier", "Current Multiplier", "P/L %", 
-		"Trailing Stop-Loss", "Stop-Loss Multiplier", "Stop-Loss Updates", "Log",
-	}
-
-	vr := &sheets.ValueRange{Values: [][]interface{}{headers}}
-	rangeStr := fmt.Sprintf("%s!A1:Q1", appConfig.SheetName)
-
-	_, err := sheetsSvc.Spreadsheets.Values.Update(
-		appConfig.SpreadsheetID, rangeStr, vr).ValueInputOption("RAW").Do()
-
-	return err
-}
-
-func getTokenMetadata(tokenAddress string) (string, float64, error) {
-	url := fmt.Sprintf("https://api.dexscreener.com/latest/dex/tokens/%s", tokenAddress)
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		return "", 0, fmt.Errorf("DexScreener API request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return "", 0, fmt.Errorf("DexScreener API returned status %d", resp.StatusCode)
-	}
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", 0, fmt.Errorf("failed to read response: %v", err)
-	}
-
-	var response DexScreenerResponse
-	if err := json.Unmarshal(body, &response); err != nil {
-		return "", 0, fmt.Errorf("failed to parse response: %v", err)
-	}
-
-	if len(response.Pairs) == 0 {
-		return "Unknown Token", 0, fmt.Errorf("no pairs found for token")
-	}
-
-	pair := response.Pairs[0]
-	tokenName := pair.BaseToken.Name
-	if tokenName == "" {
-		tokenName = pair.BaseToken.Symbol
-	}
-	if tokenName == "" {
-		tokenName = "Unknown Token"
-	}
-
-	marketCap := pair.MarketCap
-	if marketCap == 0 {
-		marketCap = pair.Fdv
-	}
-
-	return tokenName, marketCap, nil
-}
-
-func monitorTokens() {
-	log.Println("--- Monitoring Tokens ---")
+func monitorTokensEnhanced() {
+	log.Println("--- Enhanced Token Monitoring ---")
+	
 	monitoringList, err := readMonitoringListFromSheet()
 	if err != nil {
 		log.Printf("⚠️ Error reading sheet: %v", err)
 		return
 	}
 
-	for _, token := range monitoringList {
+	log.Printf("📊 Monitoring %d tokens", len(monitoringList))
+
+	// Process tokens with rate limiting
+	for i, token := range monitoringList {
+		// Add staggered delay to prevent overwhelming APIs
+		if i > 0 {
+			time.Sleep(time.Duration(200) * time.Millisecond)
+		}
+
 		switch token.Status {
 		case "NEW", "":
-			go startMonitoring(token)
+			go startMonitoringEnhanced(token)
 		case "MONITORING":
-			go monitorActiveToken(token)
+			go monitorActiveTokenEnhanced(token)
 		}
 	}
 }
 
-func startMonitoring(token TokenMonitoring) {
-	log.Printf("🆕 Starting to monitor: %s", token.TokenAddress)
+func startMonitoringEnhanced(token TokenMonitoring) {
+	log.Printf("🆕 Starting enhanced monitoring: %s", token.TokenAddress[:8])
 
-	// Get token metadata
-	tokenName, startMarketCap, err := getTokenMetadata(token.TokenAddress)
-	if err != nil {
-		log.Printf("⚠️ Could not get token metadata for %s: %v", token.TokenAddress, err)
-		tokenName = "Unknown Token"
-		startMarketCap = 0
-	}
-
-	token.TokenName = tokenName
-	token.MonitorStartMarketCap = startMarketCap
-
-	// Update status only, no logging
+	// Update status
 	vrStatus := &sheets.ValueRange{Values: [][]interface{}{{"INITIALIZING"}}}
 	rangeStrStatus := fmt.Sprintf("%s!C%d", appConfig.SheetName, token.RowIndex)
 	sheetsSvc.Spreadsheets.Values.Update(
 		appConfig.SpreadsheetID, rangeStrStatus, vrStatus).ValueInputOption("RAW").Do()
 
-	// Get starting price
-	price, err := getJupiterPrice(token.TokenAddress)
+	// Get starting price and market cap
+	price, startMarketCap, err := getEnhancedTokenPrice(token.TokenAddress)
 	if err != nil {
-		log.Printf("⚠️ Could not get starting price for %s: %v", token.TokenAddress, err)
+		log.Printf("⚠️ Could not get starting price for %s: %v", token.TokenAddress[:8], err)
 		vrStatus = &sheets.ValueRange{Values: [][]interface{}{{"FAILED"}}}
 		sheetsSvc.Spreadsheets.Values.Update(
 			appConfig.SpreadsheetID, rangeStrStatus, vrStatus).ValueInputOption("RAW").Do()
 		return
 	}
 
+	// Get token metadata for name
+	tokenName, metaMarketCap, err := getTokenMetadata(token.TokenAddress)
+	if err != nil {
+		log.Printf("⚠️ Could not get token metadata for %s: %v", token.TokenAddress[:8], err)
+		tokenName = "Unknown Token"
+	}
+
+	// Use the more reliable market cap source
+	if startMarketCap == 0 && metaMarketCap > 0 {
+		startMarketCap = metaMarketCap
+	}
+
 	// Initialize monitoring data
+	token.TokenName = tokenName
 	token.MonitorStartPrice = price
 	token.CurrentPrice = price
 	token.HighestPrice = price
+	token.MonitorStartMarketCap = startMarketCap
 	token.CurrentMarketCap = startMarketCap
 	token.HighestMarketCap = startMarketCap
 	token.CurrentMultiplier = 1.0
 	token.HighestMultiplier = 1.0
-	token.TrailingStopLoss = 0 // No initial stop-loss
+	token.TrailingStopLoss = 0
 	token.StopLossMultiplier = 0
 	token.ConsecutiveDownticks = 0
 	token.LastPriceDirection = "STABLE"
 	token.StopLossHistory = []StopLossUpdate{}
 
-	// Update status to MONITORING - no verbose logging
+	// Update status to MONITORING
 	vrStatus = &sheets.ValueRange{Values: [][]interface{}{{"MONITORING"}}}
 	sheetsSvc.Spreadsheets.Values.Update(
 		appConfig.SpreadsheetID, rangeStrStatus, vrStatus).ValueInputOption("RAW").Do()
 
 	updateMonitoringData(token)
-	log.Printf("✅ Started monitoring %s at $%.8f", tokenName, price)
+	log.Printf("✅ Enhanced monitoring started for %s at $%.8f", tokenName, price)
 }
+
+// ... (Include all the existing structs and helper functions from your original code)
 
 func monitorActiveToken(token TokenMonitoring) {
 	log.Printf("👀 Monitoring: %s (%s) - Current: %.2fx", 
