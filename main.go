@@ -1198,15 +1198,21 @@ func calculateTrailingStopLoss(token TokenMonitoring) (float64, float64) {
 	return stopLossPrice, adjustedStopLossMultiplier
 }
 
-func getJupiterPrice(tokenAddress string) (float64, error) {
+func getJupiterPrice(tokenAddress string) (float64, float64, error) {
 	price, err := getPriceFromQuote(tokenAddress)
 	if err == nil && price > 0 {
-		return price, nil
+		// Get market cap separately
+		_, marketCap, metaErr := getTokenMetadata(tokenAddress)
+		if metaErr != nil {
+			log.Printf("⚠️ Market cap fetch failed for %s: %v", tokenAddress[:8], metaErr)
+			marketCap = 0 // Use 0 if we can't get market cap
+		}
+		return price, marketCap, nil
 	}
 	log.Printf("⚠️ Quote API failed for %s: %v", tokenAddress, err)
 
 	return getPriceFromAlternativeEndpoints(tokenAddress)
-}
+}}
 
 func getPriceFromQuote(tokenAddress string) (float64, error) {
 	testAmounts := []string{"1000000", "100000", "10000", "1000"}
@@ -1229,6 +1235,16 @@ func getPriceFromQuote(tokenAddress string) (float64, error) {
 			continue
 		}
 		defer resp.Body.Close()
+
+		// Handle rate limiting
+		if resp.StatusCode == 429 {
+			log.Printf("⏳ Rate limited, waiting...")
+			time.Sleep(1 * time.Second)
+			if i == len(testAmounts)-1 {
+				return 0, fmt.Errorf("rate limited on all attempts")
+			}
+			continue
+		}
 
 		if resp.StatusCode != 200 {
 			body, _ := ioutil.ReadAll(resp.Body)
@@ -1282,7 +1298,7 @@ func getPriceFromQuote(tokenAddress string) (float64, error) {
 	return 0, fmt.Errorf("could not get valid price with any test amount")
 }
 
-func getPriceFromAlternativeEndpoints(tokenAddress string) (float64, error) {
+func getPriceFromAlternativeEndpoints(tokenAddress string) (float64, float64, error) {
 	testUSDCAmount := "1000000" // 1 USDC
 
 	url := fmt.Sprintf("%s?inputMint=%s&outputMint=%s&amount=%s&slippageBps=%d&restrictIntermediateTokens=true",
@@ -1296,41 +1312,45 @@ func getPriceFromAlternativeEndpoints(tokenAddress string) (float64, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
-		return 0, fmt.Errorf("reverse quote failed: %v", err)
+		return 0, 0, fmt.Errorf("reverse quote failed: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
 		body, _ := ioutil.ReadAll(resp.Body)
-		return 0, fmt.Errorf("reverse quote failed with status %d: %s", resp.StatusCode, string(body))
+		return 0, 0, fmt.Errorf("reverse quote failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return 0, fmt.Errorf("failed to read response: %v", err)
+		return 0, 0, fmt.Errorf("failed to read response: %v", err)
 	}
 
 	var quote JupiterQuoteResponse
 	if err := json.Unmarshal(body, &quote); err != nil {
-		return 0, fmt.Errorf("failed to parse reverse quote: %v", err)
+		return 0, 0, fmt.Errorf("failed to parse reverse quote: %v", err)
 	}
 
 	inAmount, err := strconv.ParseFloat(quote.InAmount, 64)  // USDC input
 	if err != nil {
-		return 0, fmt.Errorf("invalid inAmount in reverse quote: %v", err)
+		return 0, 0, fmt.Errorf("invalid inAmount in reverse quote: %v", err)
 	}
 
 	outAmount, err := strconv.ParseFloat(quote.OutAmount, 64) // Token output
 	if err != nil {
-		return 0, fmt.Errorf("invalid outAmount in reverse quote: %v", err)
+		return 0, 0, fmt.Errorf("invalid outAmount in reverse quote: %v", err)
 	}
 
 	if outAmount == 0 {
-		return 0, fmt.Errorf("invalid token output amount")
+		return 0, 0, fmt.Errorf("invalid token output amount")
 	}
 
 	price := inAmount / outAmount
-	return price, nil
+	
+	// Try to get market cap from DexScreener as well
+	_, marketCap, _ := getTokenMetadata(tokenAddress)
+	
+	return price, marketCap, nil
 }
 
 // Sheet Functions
