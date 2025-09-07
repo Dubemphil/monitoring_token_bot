@@ -20,6 +20,261 @@ import (
 	"google.golang.org/api/sheets/v4"
 )
 
+
+// Add these struct definitions and helper functions to your main.go file
+// Place them after the import statements and before your existing code
+
+// --- Core Data Structures ---
+type TokenMonitoring struct {
+	RowIndex                int
+	TokenAddress           string
+	TokenName              string
+	Status                 string
+	CallSource             string
+	CallTime               time.Time
+	MonitorStartPrice      float64
+	CurrentPrice           float64
+	HighestPrice           float64
+	MonitorStartMarketCap  float64
+	CurrentMarketCap       float64
+	HighestMarketCap       float64
+	CurrentMultiplier      float64
+	HighestMultiplier      float64
+	TrailingStopLoss       float64
+	StopLossMultiplier     float64
+	LastUpdated            time.Time
+	ConsecutiveDownticks   int
+	LastPriceDirection     string
+	StopLossHistory        []StopLossUpdate
+}
+
+type StopLossUpdate struct {
+	Timestamp     time.Time
+	OldStopLoss   float64
+	NewStopLoss   float64
+	OldMultiplier float64
+	NewMultiplier float64
+	ATHMultiplier float64
+	Reason        string
+}
+
+type JupiterQuoteResponse struct {
+	InputMint            string                 `json:"inputMint"`
+	InAmount             string                 `json:"inAmount"`
+	OutputMint           string                 `json:"outputMint"`
+	OutAmount            string                 `json:"outAmount"`
+	OtherAmountThreshold string                 `json:"otherAmountThreshold"`
+	SwapMode             string                 `json:"swapMode"`
+	SlippageBps          int                    `json:"slippageBps"`
+	PlatformFee          interface{}            `json:"platformFee"`
+	PriceImpactPct       string                 `json:"priceImpactPct"`
+	RoutePlan            []JupiterRoutePlan     `json:"routePlan"`
+	ContextSlot          int64                  `json:"contextSlot"`
+	TimeTaken            float64                `json:"timeTaken"`
+}
+
+type JupiterRoutePlan struct {
+	SwapInfo JupiterSwapInfo `json:"swapInfo"`
+	Percent  int             `json:"percent"`
+}
+
+type JupiterSwapInfo struct {
+	AmmKey     string `json:"ammKey"`
+	Label      string `json:"label"`
+	InputMint  string `json:"inputMint"`
+	OutputMint string `json:"outputMint"`
+	InAmount   string `json:"inAmount"`
+	OutAmount  string `json:"outAmount"`
+	FeeAmount  string `json:"feeAmount"`
+	FeeMint    string `json:"feeMint"`
+}
+
+type DexScreenerResponse struct {
+	Schemaversion string                    `json:"schemaVersion"`
+	Pairs         []DexScreenerPair         `json:"pairs"`
+}
+
+type DexScreenerPair struct {
+	ChainId      string                    `json:"chainId"`
+	DexId        string                    `json:"dexId"`
+	Url          string                    `json:"url"`
+	PairAddress  string                    `json:"pairAddress"`
+	BaseToken    DexScreenerToken          `json:"baseToken"`
+	QuoteToken   DexScreenerToken          `json:"quoteToken"`
+	PriceNative  string                    `json:"priceNative"`
+	PriceUsd     string                    `json:"priceUsd"`
+	Txns         DexScreenerTxns           `json:"txns"`
+	Volume       DexScreenerVolume         `json:"volume"`
+	PriceChange  DexScreenerPriceChange    `json:"priceChange"`
+	Liquidity    DexScreenerLiquidity      `json:"liquidity"`
+	MarketCap    float64                   `json:"marketCap"`
+	Info         DexScreenerInfo           `json:"info"`
+}
+
+type DexScreenerToken struct {
+	Address string `json:"address"`
+	Name    string `json:"name"`
+	Symbol  string `json:"symbol"`
+}
+
+type DexScreenerTxns struct {
+	M5  DexScreenerTxnCount `json:"m5"`
+	H1  DexScreenerTxnCount `json:"h1"`
+	H6  DexScreenerTxnCount `json:"h6"`
+	H24 DexScreenerTxnCount `json:"h24"`
+}
+
+type DexScreenerTxnCount struct {
+	Buys  int `json:"buys"`
+	Sells int `json:"sells"`
+}
+
+type DexScreenerVolume struct {
+	H24 float64 `json:"h24"`
+	H6  float64 `json:"h6"`
+	H1  float64 `json:"h1"`
+	M5  float64 `json:"m5"`
+}
+
+type DexScreenerPriceChange struct {
+	M5  float64 `json:"m5"`
+	H1  float64 `json:"h1"`
+	H6  float64 `json:"h6"`
+	H24 float64 `json:"h24"`
+}
+
+type DexScreenerLiquidity struct {
+	Usd   float64 `json:"usd"`
+	Base  float64 `json:"base"`
+	Quote float64 `json:"quote"`
+}
+
+type DexScreenerInfo struct {
+	ImageUrl    string                 `json:"imageUrl"`
+	Websites    []DexScreenerWebsite   `json:"websites"`
+	Socials     []DexScreenerSocial    `json:"socials"`
+}
+
+type DexScreenerWebsite struct {
+	Label string `json:"label"`
+	Url   string `json:"url"`
+}
+
+type DexScreenerSocial struct {
+	Type string `json:"type"`
+	Url  string `json:"url"`
+}
+
+// --- Missing Helper Functions ---
+
+func initializeServices() error {
+	log.Println("Initializing services...")
+
+	// Initialize Google Sheets service
+	ctx := context.Background()
+	credPath := "credentials.json"
+	
+	if _, err := os.Stat(credPath); os.IsNotExist(err) {
+		return fmt.Errorf("credentials.json file not found")
+	}
+
+	sheetsService, err := sheets.NewService(ctx, option.WithCredentialsFile(credPath))
+	if err != nil {
+		return fmt.Errorf("unable to create sheets service: %v", err)
+	}
+	sheetsSvc = sheetsService
+
+	log.Println("✅ Google Sheets service initialized")
+	return nil
+}
+
+func testJupiterAPI() error {
+	testURL := fmt.Sprintf("%s?inputMint=%s&outputMint=%s&amount=1000000&slippageBps=100",
+		jupiterEndpoints.QuoteV1,
+		"So11111111111111111111111111111111111111112", // SOL
+		appConfig.USDCTokenAddress,
+	)
+
+	resp, err := httpClient.Get(testURL)
+	if err != nil {
+		return fmt.Errorf("Jupiter API test request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("Jupiter API returned status %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+func ensureSheetHeaders() error {
+	headers := [][]interface{}{
+		{
+			"Token Address", "Token Name", "Status", "Call Source", "Call Time",
+			"Start Price", "Current Price", "Start MC", "Current MC", "Highest MC",
+			"Peak Multiplier", "Current Multiplier", "Profit %", "Stop-Loss Price",
+			"Stop-Loss Multiplier", "Stop-Loss Updates", "Activity Log",
+		},
+	}
+
+	vr := &sheets.ValueRange{Values: headers}
+	rangeStr := fmt.Sprintf("%s!A1:Q1", appConfig.SheetName)
+	_, err := sheetsSvc.Spreadsheets.Values.Update(
+		appConfig.SpreadsheetID, rangeStr, vr).ValueInputOption("RAW").Do()
+
+	if err != nil {
+		return fmt.Errorf("failed to create headers: %v", err)
+	}
+
+	log.Println("✅ Sheet headers ensured")
+	return nil
+}
+
+func getTokenMetadata(tokenAddress string) (string, float64, error) {
+	// Try DexScreener first
+	url := fmt.Sprintf("https://api.dexscreener.com/latest/dex/tokens/%s", tokenAddress)
+	
+	resp, err := httpClient.Get(url)
+	if err != nil {
+		return "Unknown Token", 0, fmt.Errorf("DexScreener request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return "Unknown Token", 0, fmt.Errorf("DexScreener returned status %d", resp.StatusCode)
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "Unknown Token", 0, fmt.Errorf("failed to read DexScreener response: %v", err)
+	}
+
+	var dexResponse DexScreenerResponse
+	if err := json.Unmarshal(body, &dexResponse); err != nil {
+		return "Unknown Token", 0, fmt.Errorf("failed to parse DexScreener response: %v", err)
+	}
+
+	if len(dexResponse.Pairs) == 0 {
+		return "Unknown Token", 0, fmt.Errorf("no pairs found on DexScreener")
+	}
+
+	// Get the first pair (usually the most liquid)
+	pair := dexResponse.Pairs[0]
+	tokenName := pair.BaseToken.Name
+	if tokenName == "" {
+		tokenName = pair.BaseToken.Symbol
+	}
+	if tokenName == "" {
+		tokenName = "Unknown Token"
+	}
+
+	marketCap := pair.MarketCap
+	return tokenName, marketCap, nil
+}
+
+
+
 // --- Enhanced Configuration ---
 type Config struct {
 	SpreadsheetID       string
