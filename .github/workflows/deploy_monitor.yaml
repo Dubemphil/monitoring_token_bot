@@ -1,4 +1,4 @@
-name: 'Deploy Enhanced Solana Monitor (Python) with Load Balancing'
+name: 'Deploy Solana Monitor - DexScreener Real-Time Version'
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
       - main
 
 env:
-  DOCKER_IMAGE: "solana_monitor_bot_python"
+  DOCKER_IMAGE: "solana_monitor_dexscreener"
   DOCKER_TAG: ${{ github.sha }}
 
 jobs:
@@ -26,7 +26,7 @@ jobs:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-    - name: Build and push Python Docker image
+    - name: Build and push Docker image
       uses: docker/build-push-action@v5
       with:
         context: .
@@ -38,7 +38,7 @@ jobs:
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
-    - name: Deploy Python Monitor Bot to EC2
+    - name: Deploy to EC2
       uses: appleboy/ssh-action@v1.0.0
       with:
         host: ${{ secrets.EC2_HOST }}
@@ -52,8 +52,8 @@ jobs:
           echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login --username "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
 
           # Stop and remove existing container
-          docker stop solana_monitor_python 2>/dev/null || true
-          docker rm solana_monitor_python 2>/dev/null || true
+          docker stop solana_monitor_dex 2>/dev/null || true
+          docker rm solana_monitor_dex 2>/dev/null || true
 
           # Remove old image
           docker rmi ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE }}:latest 2>/dev/null || true
@@ -70,72 +70,49 @@ jobs:
             exit 1
           fi
 
-          # Create logs directory structure
+          # Create logs directory
           mkdir -p /home/${{ secrets.EC2_USER }}/logs
-          touch /home/${{ secrets.EC2_USER }}/logs/enhanced-monitor.log
-          touch /home/${{ secrets.EC2_USER }}/logs/rpc-balancer.log
-          touch /home/${{ secrets.EC2_USER }}/logs/webhook-activity.log
-          touch /home/${{ secrets.EC2_USER }}/logs/price-cache.log
-          touch /home/${{ secrets.EC2_USER }}/logs/stop-loss-tracking.log
+          touch /home/${{ secrets.EC2_USER }}/logs/dexscreener-monitor.log
+          touch /home/${{ secrets.EC2_USER }}/logs/milestone-tracking.log
+          touch /home/${{ secrets.EC2_USER }}/logs/price-updates.log
 
-          # Run Python monitoring container
+          # Run monitoring container
           docker run -d \
-            --name solana_monitor_python \
+            --name solana_monitor_dex \
             --restart unless-stopped \
             --dns 8.8.8.8 \
             --dns 1.1.1.1 \
-            -p 8080:8080 \
             -e SPREADSHEET_ID="${{ secrets.SPREADSHEET_ID }}" \
             -e SHEET_NAME="SolanaMonitoring" \
-            -e HELIUS_RPC_URLS="${{ secrets.HELIUS_RPC_URL_1 }},${{ secrets.HELIUS_RPC_URL_2 }},${{ secrets.HELIUS_RPC_URL_3 }},${{ secrets.HELIUS_RPC_URL_4 }},${{ secrets.HELIUS_RPC_URL_5 }}" \
-            -e TICK_INTERVAL_SECONDS="8" \
-            -e MONITORING_DURATION_HOURS="24" \
-            -e USDC_TOKEN_ADDRESS="${{ secrets.USDC_TOKEN_ADDRESS }}" \
-            -e SLIPPAGE_BPS="100" \
-            -e RATE_LIMIT_MS="200" \
-            -e WEBHOOK_PORT="8080" \
-            -e ENABLE_WEBHOOKS="true" \
-            -e ENABLE_DETAILED_LOGGING="true" \
+            -e TICK_INTERVAL_SECONDS="1" \
+            -e RATE_LIMIT_MS="100" \
             -v /home/${{ secrets.EC2_USER }}/credentials.json:/app/credentials.json:ro \
             -v /home/${{ secrets.EC2_USER }}/logs:/app/logs \
             ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE }}:latest
 
           # Wait for container to start
-          sleep 20
+          sleep 15
 
           # Check container status
-          if docker ps | grep -q solana_monitor_python; then
-            echo "✅ Python Monitor container is running"
-            docker logs solana_monitor_python --tail 30
-            
-            # Test webhook endpoint
-            curl -f http://localhost:8080/health || echo "⚠️ Webhook endpoint not responding yet"
+          if docker ps | grep -q solana_monitor_dex; then
+            echo "✅ Monitor container is running"
+            docker logs solana_monitor_dex --tail 30
             
             # Set up log monitoring script
             cat > /home/${{ secrets.EC2_USER }}/monitor_logs.sh << 'LOGSCRIPT'
           #!/bin/bash
           
-          docker logs solana_monitor_python --follow --tail 0 2>&1 | while read line; do
-            echo "$line" >> /home/${{ secrets.EC2_USER }}/logs/enhanced-monitor.log
+          docker logs solana_monitor_dex --follow --tail 0 2>&1 | while read line; do
+            echo "$line" >> /home/${{ secrets.EC2_USER }}/logs/dexscreener-monitor.log
             
-            # Track RPC activity
-            if echo "$line" | grep -qi "rpc\|balancer\|rate.*limit"; then
-              echo "$(date '+%Y-%m-%d %H:%M:%S') $line" >> /home/${{ secrets.EC2_USER }}/logs/rpc-balancer.log
+            # Track milestone events
+            if echo "$line" | grep -qi "milestone\|crossed\|📈\|📉"; then
+              echo "$(date '+%Y-%m-%d %H:%M:%S') $line" >> /home/${{ secrets.EC2_USER }}/logs/milestone-tracking.log
             fi
             
-            # Track webhook activity
-            if echo "$line" | grep -qi "webhook\|cached\|📡"; then
-              echo "$(date '+%Y-%m-%d %H:%M:%S') $line" >> /home/${{ secrets.EC2_USER }}/logs/webhook-activity.log
-            fi
-            
-            # Track price cache
-            if echo "$line" | grep -qi "cache\|🔄"; then
-              echo "$(date '+%Y-%m-%d %H:%M:%S') $line" >> /home/${{ secrets.EC2_USER }}/logs/price-cache.log
-            fi
-            
-            # Track stop-loss events
-            if echo "$line" | grep -qi "stop-loss\|🛑\|trailing"; then
-              echo "$(date '+%Y-%m-%d %H:%M:%S') $line" >> /home/${{ secrets.EC2_USER }}/logs/stop-loss-tracking.log
+            # Track price updates
+            if echo "$line" | grep -qi "updating\|price\|👀"; then
+              echo "$(date '+%Y-%m-%d %H:%M:%S') $line" >> /home/${{ secrets.EC2_USER }}/logs/price-updates.log
             fi
           done &
           LOGSCRIPT
@@ -145,45 +122,35 @@ jobs:
             
             echo ""
             echo "📋 Log Monitoring Commands:"
-            echo "   View all logs: docker logs -f solana_monitor_python"
-            echo "   View main log: tail -f /home/${{ secrets.EC2_USER }}/logs/enhanced-monitor.log"
-            echo "   View RPC log: tail -f /home/${{ secrets.EC2_USER }}/logs/rpc-balancer.log"
-            echo "   View webhook log: tail -f /home/${{ secrets.EC2_USER }}/logs/webhook-activity.log"
-            echo "   View stop-loss log: tail -f /home/${{ secrets.EC2_USER }}/logs/stop-loss-tracking.log"
+            echo "   View all logs: docker logs -f solana_monitor_dex"
+            echo "   View main log: tail -f /home/${{ secrets.EC2_USER }}/logs/dexscreener-monitor.log"
+            echo "   View milestones: tail -f /home/${{ secrets.EC2_USER }}/logs/milestone-tracking.log"
+            echo "   View price updates: tail -f /home/${{ secrets.EC2_USER }}/logs/price-updates.log"
             echo ""
             
           else
-            echo "❌ Python Monitor container failed to start"
-            docker logs solana_monitor_python --tail 50 || true
+            echo "❌ Monitor container failed to start"
+            docker logs solana_monitor_dex --tail 50 || true
             exit 1
           fi
 
           # Save deployment logs
-          docker logs solana_monitor_python --tail 100 > /home/${{ secrets.EC2_USER }}/logs/deploy-$TIMESTAMP.txt 2>&1 || true
-          
-          # Test health endpoint
-          sleep 5
-          if curl -s http://localhost:8080/health | grep -q "healthy"; then
-            echo "✅ Health check passed"
-          else
-            echo "⚠️ Health check failed - but continuing"
-          fi
+          docker logs solana_monitor_dex --tail 100 > /home/${{ secrets.EC2_USER }}/logs/deploy-$TIMESTAMP.txt 2>&1 || true
           
           # Logout from Docker Hub
           docker logout
 
-          echo "✅ Python Solana Monitor Bot deployed successfully!"
+          echo "✅ DexScreener Monitor deployed successfully!"
           echo ""
           echo "📊 Monitoring Information:"
-          echo "   - Container name: solana_monitor_python"
-          echo "   - RPC Load Balancing: 5 endpoints"
-          echo "   - Webhook server: http://localhost:8080"
-          echo "   - Health check: http://localhost:8080/health"
+          echo "   - Container name: solana_monitor_dex"
+          echo "   - Update interval: 1 second (real-time)"
+          echo "   - Data source: DexScreener API"
+          echo "   - Auto-detection: Column A"
           echo ""
           echo "📋 Useful Commands:"
-          echo "   docker logs -f solana_monitor_python              # Live logs"
-          echo "   docker logs solana_monitor_python --tail 100      # Last 100 lines"
-          echo "   docker stats solana_monitor_python                # Resource usage"
-          echo "   docker exec -it solana_monitor_python /bin/sh    # Shell access"
-          echo "   docker restart solana_monitor_python              # Restart container"
+          echo "   docker logs -f solana_monitor_dex              # Live logs"
+          echo "   docker logs solana_monitor_dex --tail 100      # Last 100 lines"
+          echo "   docker stats solana_monitor_dex                # Resource usage"
+          echo "   docker restart solana_monitor_dex              # Restart container"
           echo ""
