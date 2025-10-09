@@ -258,7 +258,7 @@ async def get_dexscreener_data_batch(token_addresses: List[str]) -> Dict[str, Tu
         if i + batch_size < len(token_addresses):
             await asyncio.sleep(app_state.config.rate_limit_delay)
     
-    return all_results mc)
+    return all_results mc
                     else:
                         all_results[addr] = ("Unknown Token", 0.0, 0.0)
                         logger.warning(f"No data found for {addr[:8]}")
