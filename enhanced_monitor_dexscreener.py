@@ -415,7 +415,7 @@ def batch_update_tokens(tokens_to_update: List[TokenMonitoring]):
 def scan_for_new_tokens() -> List[Tuple[int, str]]:
     """Scan Column A for new token addresses"""
     try:
-        range_str = f"{app_state.config.sheet_name}!A2:A"
+        range_str = f"{app_state.config.sheet_name}!B2:B"
         result = app_state.sheets_service.spreadsheets().values().get(
             spreadsheetId=app_state.config.spreadsheet_id,
             range=range_str
