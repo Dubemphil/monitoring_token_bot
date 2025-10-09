@@ -98,7 +98,7 @@ jobs:
             --dns 8.8.8.8 \
             --dns 1.1.1.1 \
             -e SPREADSHEET_ID="${{ secrets.SPREADSHEET_ID }}" \
-            -e SHEET_NAME="SolanaMonitoring" \
+            -e SHEET_NAME="SolanaTrades" \
             -e TICK_INTERVAL_SECONDS="1" \
             -e RATE_LIMIT_MS="100" \
             -v /home/${{ secrets.EC2_USER }}/credentials.json:/app/credentials.json:ro \
