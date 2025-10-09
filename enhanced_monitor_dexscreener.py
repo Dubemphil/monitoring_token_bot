@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Enhanced Solana Token Monitoring Bot - DexScreener Real-Time Version,
+Enhanced Solana Token Monitoring Bot - DexScreener Real-Time Version.
 FIXED: Batched updates to avoid Google Sheets API rate limits and removed duplicated/syntax errors.
 """
 
