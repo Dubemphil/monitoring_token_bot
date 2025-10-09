@@ -105,7 +105,7 @@ jobs:
             -v /home/${{ secrets.EC2_USER }}/logs:/app/logs \
             ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE }}:latest
 
-          # Wait for container to start
+          # Wait for container to start.
           sleep 15
 
           # Check container status
