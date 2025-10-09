@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Enhanced Solana Token Monitoring Bot - DexScreener Real-Time Version
-FIXED: Batched updates to avoid Google Sheets API rate limits
+FIXED: Batched updates to avoid Google Sheets API rate limits and removed duplicated/syntax errors.
 """
 
 import os
@@ -19,14 +19,24 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+# Ensure log dir exists
+LOG_DIR = "/app/logs"
+if not os.path.exists(LOG_DIR):
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+    except Exception:
+        # Fallback to stdout-only logging if permission denied
+        LOG_DIR = None
+
 # Configure logging
+handlers = [logging.StreamHandler(sys.stdout)]
+if LOG_DIR:
+    handlers.append(logging.FileHandler(os.path.join(LOG_DIR, 'dexscreener-monitor.log')))
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('/app/logs/dexscreener-monitor.log')
-    ]
+    handlers=handlers
 )
 logger = logging.getLogger(__name__)
 
@@ -105,12 +115,13 @@ def load_config() -> Config:
     rate_limit_delay = float(os.getenv("RATE_LIMIT_MS", "100")) / 1000.0
     batch_update_interval = int(os.getenv("BATCH_UPDATE_INTERVAL", "60"))  # Update all every 60 ticks
     max_requests_per_minute = int(os.getenv("MAX_DEXSCREENER_REQUESTS_PER_MIN", "250"))  # Conservative limit
-    
+    dexscreener_api_url = os.getenv("DEXSCREENER_API_URL", "https://api.dexscreener.com/tokens/v1/solana/")
+
     config = Config(
         spreadsheet_id=spreadsheet_id,
         sheet_name=sheet_name,
         tick_interval_seconds=tick_interval_seconds,
-        dexscreener_api_url="https://api.dexscreener.com/latest/dex/tokens/",
+        dexscreener_api_url=dexscreener_api_url,
         rate_limit_delay=rate_limit_delay,
         batch_update_interval=batch_update_interval,
         max_requests_per_minute=max_requests_per_minute
@@ -173,14 +184,15 @@ async def get_dexscreener_data_batch(token_addresses: List[str]) -> Dict[str, Tu
     if (now - app_state.last_minute_reset).total_seconds() >= 60:
         app_state.api_calls_this_minute = 0
         app_state.last_minute_reset = now
-        logger.debug(f"✅ Rate limit counter reset")
+        logger.debug("✅ Rate limit counter reset")
     
     # DexScreener supports up to 30 tokens per request
     batch_size = 30
-    all_results = {}
+    all_results: Dict[str, Tuple[str, float, float]] = {}
     
     for i in range(0, len(token_addresses), batch_size):
-        # Check if we're approaching rate limit
+        # Recompute now for accurate wait calculation
+        now = datetime.now()
         if app_state.api_calls_this_minute >= app_state.config.max_requests_per_minute:
             wait_time = 60 - (now - app_state.last_minute_reset).total_seconds()
             if wait_time > 0:
@@ -192,19 +204,22 @@ async def get_dexscreener_data_batch(token_addresses: List[str]) -> Dict[str, Tu
         batch = token_addresses[i:i + batch_size]
         addresses_str = ",".join(batch)
         
-        # Use the BATCH endpoint: /tokens/v1/solana/{addresses}
-        url = f"https://api.dexscreener.com/tokens/v1/solana/{addresses_str}"
+        # Use the BATCH endpoint via configured base URL
+        url = f"{app_state.config.dexscreener_api_url}{addresses_str}"
         
         try:
             app_state.api_calls_this_minute += 1
-            logger.debug(f"🌐 API call #{app_state.api_calls_this_minute} this minute")
+            logger.debug(f"🌐 API call #{app_state.api_calls_this_minute} this minute -> {url}")
             
             async with app_state.http_session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 429:
-                    logger.error(f"⚠️ DexScreener rate limit hit! Waiting 60s...")
+                    logger.error("⚠️ DexScreener rate limit hit! Waiting 60s...")
                     await asyncio.sleep(60)
                     app_state.api_calls_this_minute = 0
                     app_state.last_minute_reset = datetime.now()
+                    # Mark all batch as unknown and continue
+                    for addr in batch:
+                        all_results[addr] = ("Unknown Token", 0.0, 0.0)
                     continue
                 
                 if resp.status != 200:
@@ -218,7 +233,7 @@ async def get_dexscreener_data_batch(token_addresses: List[str]) -> Dict[str, Tu
                 pairs_list = data if isinstance(data, list) else data.get('pairs', [])
                 
                 # Create a map of token addresses to their best pair data
-                token_data_map = {}
+                token_data_map: Dict[str, Tuple[str, float, float, float]] = {}
                 for pair in pairs_list:
                     base_token = pair.get('baseToken', {})
                     token_addr = base_token.get('address', '').strip()
@@ -228,9 +243,18 @@ async def get_dexscreener_data_batch(token_addresses: List[str]) -> Dict[str, Tu
                     
                     # Get token info
                     token_name = base_token.get('name') or base_token.get('symbol', 'Unknown Token')
-                    price_usd = float(pair.get('priceUsd', 0))
-                    market_cap = float(pair.get('fdv', 0)) or float(pair.get('marketCap', 0))
-                    liquidity = float(pair.get('liquidity', {}).get('usd', 0))
+                    try:
+                        price_usd = float(pair.get('priceUsd', 0) or 0)
+                    except (TypeError, ValueError):
+                        price_usd = 0.0
+                    try:
+                        market_cap = float(pair.get('fdv', 0) or pair.get('marketCap', 0) or 0)
+                    except (TypeError, ValueError):
+                        market_cap = 0.0
+                    try:
+                        liquidity = float((pair.get('liquidity') or {}).get('usd', 0) or 0)
+                    except (TypeError, ValueError):
+                        liquidity = 0.0
                     
                     # Keep the pair with highest liquidity for each token
                     if token_addr not in token_data_map or liquidity > token_data_map[token_addr][3]:
@@ -241,24 +265,6 @@ async def get_dexscreener_data_batch(token_addresses: List[str]) -> Dict[str, Tu
                     if addr in token_data_map:
                         name, price, mc, _ = token_data_map[addr]
                         all_results[addr] = (name, price, mc)
-                    else:
-                        all_results[addr] = ("Unknown Token", 0.0, 0.0)
-                        logger.warning(f"No data found for {addr[:8]}")
-        
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout fetching batch of {len(batch)} tokens")
-            for addr in batch:
-                all_results[addr] = ("Unknown Token", 0.0, 0.0)
-        except Exception as e:
-            logger.warning(f"Batch request failed: {e}")
-            for addr in batch:
-                all_results[addr] = ("Unknown Token", 0.0, 0.0)
-        
-        # Small delay between batches if needed
-        if i + batch_size < len(token_addresses):
-            await asyncio.sleep(app_state.config.rate_limit_delay)
-    
-    return all_results mc
                     else:
                         all_results[addr] = ("Unknown Token", 0.0, 0.0)
                         logger.warning(f"No data found for {addr[:8]}")
@@ -396,8 +402,8 @@ def batch_update_tokens(tokens_to_update: List[TokenMonitoring]):
             token.initial_write_done = True
     
     except HttpError as e:
-        if e.resp.status == 429:
-            logger.error(f"⚠️ Rate limit hit during batch update. Waiting 60s...")
+        if hasattr(e, 'resp') and getattr(e.resp, 'status', None) == 429:
+            logger.error("⚠️ Rate limit hit during batch update. Waiting 60s...")
             time.sleep(60)
         else:
             logger.error(f"Batch update failed: {e}")
@@ -497,7 +503,7 @@ async def update_token_prices_batch(tokens: List[TokenMonitoring]):
             )
             
             if price == 0:
-                logger.warning(f"⚠️ Failed to get price for {token.token_name}")
+                logger.warning(f"⚠️ Failed to get price for {token.token_name or token.token_address[:8]}")
                 continue
             
             # Store previous multiplier
@@ -543,16 +549,16 @@ async def update_token_prices_batch(tokens: List[TokenMonitoring]):
                     
                     emoji = "📈" if direction == "UP" else "📉"
                     logger.info(
-                        f"{emoji} {token.token_name} crossed {milestone_value:.2f}x {direction} | "
+                        f"{emoji} {token.token_name or token.token_address[:8]} crossed {milestone_value:.2f}x {direction} | "
                         f"Current: {token.current_multiplier:.2f}x | Price: ${price:.8f}"
                     )
                 
                 token.needs_update = True  # Mark for batched update
             else:
-                logger.debug(f"👀 {token.token_name}: {token.current_multiplier:.4f}x")
+                logger.debug(f"👀 {token.token_name or token.token_address[:8]}: {token.current_multiplier:.4f}x")
         
         except Exception as e:
-            logger.error(f"Error processing {token.token_name}: {e}")
+            logger.error(f"Error processing {token.token_name or token.token_address[:8]}: {e}")
 
 # --- Main Loop ---
 
@@ -603,7 +609,7 @@ async def monitoring_loop():
             await asyncio.sleep(app_state.config.tick_interval_seconds)
         
         except Exception as e:
-            logger.error(f"Error in monitoring loop: {e}")
+            logger.error(f"Error in monitoring loop: {e}", exc_info=True)
             await asyncio.sleep(5)
 
 # --- Main Application ---
@@ -624,6 +630,8 @@ async def main_async():
         name, price, mc = await get_dexscreener_data(test_token)
         if price > 0:
             logger.info(f"✅ DexScreener API test passed: SOL = ${price:.2f}")
+        else:
+            logger.warning("⚠️ DexScreener API returned zero price for test token.")
     except Exception as e:
         logger.warning(f"DexScreener test failed: {e}")
     
