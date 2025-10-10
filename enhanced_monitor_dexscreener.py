@@ -159,13 +159,19 @@ def ensure_sheet_headers():
 
 # --- DexScreener Price Fetching (SINGLE BATCH CALL) ---
 
-async def get_all_token_prices_batch() -> Dict[str, Tuple[str, float, float]]:
+async def get_all_token_prices_batch(additional_addresses: List[str] = None) -> Dict[str, Tuple[str, float, float]]:
     """
-    OPTIMIZED: Fetch ALL monitored tokens in MINIMUM API calls
+    OPTIMIZED: Fetch ALL monitored tokens + new tokens in MINIMUM API calls
     Returns dict: {token_address: (name, price, market_cap)}
     """
     with app_state._lock:
         token_addresses = list(app_state.monitored_tokens.keys())
+    
+    # Add new tokens that aren't monitored yet
+    if additional_addresses:
+        for addr in additional_addresses:
+            if addr not in token_addresses:
+                token_addresses.append(addr)
     
     if not token_addresses:
         return {}
@@ -420,8 +426,10 @@ async def start_monitoring_token(row_index: int, token_address: str, initial_pri
     """Initialize monitoring for a new token using already-fetched price data"""
     token_name, price, market_cap = initial_price_data
     
+    logger.info(f"🔍 Attempting to start monitoring: Row {row_index} | {token_address[:8]}... | Price: ${price:.8f}")
+    
     if price == 0:
-        logger.error(f"❌ Could not get price for {token_address[:8]}")
+        logger.error(f"❌ Could not get price for {token_address[:8]} - price is 0")
         return
     
     # Create token monitoring object
@@ -438,14 +446,20 @@ async def start_monitoring_token(row_index: int, token_address: str, initial_pri
         has_crossed_threshold=False
     )
     
-    # Add to monitored tokens
+    # Add to monitored tokens FIRST
     with app_state._lock:
         app_state.monitored_tokens[token_address] = token
     
-    # IMMEDIATE INITIAL WRITE: Write to sheet as soon as monitoring starts
-    batch_update_tokens([token])
+    logger.info(f"✅ Token added to monitoring list: {token_name} (Total: {len(app_state.monitored_tokens)})")
     
-    logger.info(f"✅ Monitoring started: {token_name} | ${price:.8f} | MC: ${market_cap:.0f}")
+    # IMMEDIATE INITIAL WRITE: Write to sheet as soon as monitoring starts
+    try:
+        batch_update_tokens([token])
+        logger.info(f"📝 Initial write completed for {token_name}")
+    except Exception as e:
+        logger.error(f"❌ Failed to write initial data for {token_name}: {e}")
+    
+    logger.info(f"✅ Monitoring fully started: {token_name} | ${price:.8f} | MC: ${market_cap:.0f}")
 
 async def update_all_tokens_and_check_thresholds(price_data: Dict[str, Tuple[str, float, float]]):
     """
@@ -526,23 +540,28 @@ async def monitoring_loop():
             # Step 1: Scan for new tokens
             new_tokens = scan_for_new_tokens()
             
-            # Step 2: SINGLE BATCH PRICE FETCH FOR ALL TOKENS (including new ones)
-            # Add new tokens to the list temporarily to get their initial prices
-            temp_addresses = {}
             if new_tokens:
-                for row_index, token_address in new_tokens:
-                    temp_addresses[token_address] = row_index
+                logger.info(f"📥 Found {len(new_tokens)} NEW token(s) to monitor: {[(addr[:8], row) for row, addr in new_tokens]}")
+            
+            # Step 2: SINGLE BATCH PRICE FETCH FOR ALL TOKENS (including new ones)
+            # Pass new token addresses to the batch fetcher
+            new_addresses = [token_address for _, token_address in new_tokens]
             
             # Fetch ALL prices in one batch
-            logger.info(f"👀 Tick #{app_state.tick_counter}: Fetching prices for ALL tokens in batch...")
-            price_data = await get_all_token_prices_batch()
+            logger.info(f"👀 Tick #{app_state.tick_counter}: Fetching prices for {len(app_state.monitored_tokens) + len(new_addresses)} token(s) in batch...")
+            price_data = await get_all_token_prices_batch(additional_addresses=new_addresses)
+            
+            logger.debug(f"📊 Received price data for {len(price_data)} token(s)")
             
             # Step 3: Initialize new tokens using fetched data
             if new_tokens:
-                logger.info(f"📥 Initializing {len(new_tokens)} new token(s)...")
+                logger.info(f"🆕 Initializing {len(new_tokens)} new token(s)...")
                 for row_index, token_address in new_tokens:
                     if token_address in price_data:
+                        logger.info(f"   ➤ Token {token_address[:8]} found in price data")
                         await start_monitoring_token(row_index, token_address, price_data[token_address])
+                    else:
+                        logger.error(f"   ✗ Token {token_address[:8]} NOT found in price data!")
             
             # Step 4: Update ALL monitored tokens and check for threshold crossings
             tokens_to_update = await update_all_tokens_and_check_thresholds(price_data)
