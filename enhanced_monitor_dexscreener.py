@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Enhanced Solana Token Monitoring Bot - DexScreener Real-Time Version.
-FIXED: Batched updates to avoid Google Sheets API rate limits and removed duplicated/syntax errors.
+OPTIMIZED: Batch price fetching, threshold-only updates, reduced columns.
 """
 
 import os
@@ -25,7 +25,6 @@ if not os.path.exists(LOG_DIR):
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
     except Exception:
-        # Fallback to stdout-only logging if permission denied
         LOG_DIR = None
 
 # Configure logging
@@ -57,20 +56,13 @@ class TokenMonitoring:
     token_name: str = ""
     status: str = "NEW"
     monitor_start_price: float = 0.0
-    current_price: float = 0.0
-    highest_price: float = 0.0
-    lowest_price: float = 0.0
     monitor_start_market_cap: float = 0.0
-    current_market_cap: float = 0.0
-    highest_market_cap: float = 0.0
     current_multiplier: float = 1.0
-    highest_multiplier: float = 1.0
-    lowest_multiplier: float = 1.0
     last_updated: Optional[datetime] = None
     milestone_history: List[MultiplierMilestone] = field(default_factory=list)
     last_logged_milestone: float = 0.0
     initial_write_done: bool = False
-    needs_update: bool = False  # NEW: Track if update is needed
+    has_crossed_threshold: bool = False  # NEW: Track if threshold crossed
 
 @dataclass
 class Config:
@@ -79,8 +71,7 @@ class Config:
     tick_interval_seconds: float
     dexscreener_api_url: str
     rate_limit_delay: float
-    batch_update_interval: int  # NEW: How many ticks between forced updates
-    max_requests_per_minute: int  # NEW: DexScreener rate limit
+    max_requests_per_minute: int
 
 # --- Global State ---
 
@@ -91,9 +82,9 @@ class AppState:
         self.http_session: Optional[aiohttp.ClientSession] = None
         self.monitored_tokens: Dict[str, TokenMonitoring] = {}
         self._lock = Lock()
-        self.tick_counter = 0  # NEW: Count ticks for periodic updates
-        self.api_calls_this_minute = 0  # NEW: Track API calls
-        self.last_minute_reset = datetime.now()  # NEW: Track when to reset counter
+        self.tick_counter = 0
+        self.api_calls_this_minute = 0
+        self.last_minute_reset = datetime.now()
 
 app_state = AppState()
 
@@ -113,8 +104,7 @@ def load_config() -> Config:
     
     tick_interval_seconds = float(os.getenv("TICK_INTERVAL_SECONDS", "1"))
     rate_limit_delay = float(os.getenv("RATE_LIMIT_MS", "100")) / 1000.0
-    batch_update_interval = int(os.getenv("BATCH_UPDATE_INTERVAL", "60"))  # Update all every 60 ticks
-    max_requests_per_minute = int(os.getenv("MAX_DEXSCREENER_REQUESTS_PER_MIN", "250"))  # Conservative limit
+    max_requests_per_minute = int(os.getenv("MAX_DEXSCREENER_REQUESTS_PER_MIN", "250"))
     dexscreener_api_url = os.getenv("DEXSCREENER_API_URL", "https://api.dexscreener.com/tokens/v1/solana/")
 
     config = Config(
@@ -123,11 +113,10 @@ def load_config() -> Config:
         tick_interval_seconds=tick_interval_seconds,
         dexscreener_api_url=dexscreener_api_url,
         rate_limit_delay=rate_limit_delay,
-        batch_update_interval=batch_update_interval,
         max_requests_per_minute=max_requests_per_minute
     )
     
-    logger.info(f"✅ Configuration loaded: Tick: {tick_interval_seconds}s, Batch: {batch_update_interval}, API limit: {max_requests_per_minute}/min")
+    logger.info(f"✅ Configuration loaded: Tick: {tick_interval_seconds}s, API limit: {max_requests_per_minute}/min")
     return config
 
 # --- Service Initialization ---
@@ -148,14 +137,13 @@ def initialize_services():
     logger.info("✅ Google Sheets service initialized")
 
 def ensure_sheet_headers():
-    """Create headers for the monitoring sheet"""
+    """Create headers for the monitoring sheet - REDUCED COLUMNS (Column A left empty)"""
     headers = [[
-        "Token Address", "Token Name", "Status", "Start Price", "Current Price", 
-        "Start MC", "Current MC", "Highest MC", "Current Multiplier",
-        "Lowest Multiplier", "Profit %", "Multiplier Tracking"
+        "", "Token Address", "Token Name", "Status", "Start Price", 
+        "Start MC", "Current Multiplier", "Profit %", "Multiplier Tracking"
     ]]
     
-    range_str = f"{app_state.config.sheet_name}!A1:L1"
+    range_str = f"{app_state.config.sheet_name}!A1:I1"
     body = {'values': headers}
     
     try:
@@ -165,17 +153,20 @@ def ensure_sheet_headers():
             valueInputOption='RAW',
             body=body
         ).execute()
-        logger.info("✅ Sheet headers ensured")
+        logger.info("✅ Sheet headers ensured (Column A empty)")
     except HttpError as e:
         logger.error(f"Failed to create headers: {e}")
 
-# --- DexScreener Price Fetching ---
+# --- DexScreener Price Fetching (SINGLE BATCH CALL) ---
 
-async def get_dexscreener_data_batch(token_addresses: List[str]) -> Dict[str, Tuple[str, float, float]]:
+async def get_all_token_prices_batch() -> Dict[str, Tuple[str, float, float]]:
     """
-    OPTIMIZED: Fetch up to 30 tokens in a SINGLE API call
+    OPTIMIZED: Fetch ALL monitored tokens in MINIMUM API calls
     Returns dict: {token_address: (name, price, market_cap)}
     """
+    with app_state._lock:
+        token_addresses = list(app_state.monitored_tokens.keys())
+    
     if not token_addresses:
         return {}
     
@@ -191,7 +182,6 @@ async def get_dexscreener_data_batch(token_addresses: List[str]) -> Dict[str, Tu
     all_results: Dict[str, Tuple[str, float, float]] = {}
     
     for i in range(0, len(token_addresses), batch_size):
-        # Recompute now for accurate wait calculation
         now = datetime.now()
         if app_state.api_calls_this_minute >= app_state.config.max_requests_per_minute:
             wait_time = 60 - (now - app_state.last_minute_reset).total_seconds()
@@ -204,12 +194,11 @@ async def get_dexscreener_data_batch(token_addresses: List[str]) -> Dict[str, Tu
         batch = token_addresses[i:i + batch_size]
         addresses_str = ",".join(batch)
         
-        # Use the BATCH endpoint via configured base URL
         url = f"{app_state.config.dexscreener_api_url}{addresses_str}"
         
         try:
             app_state.api_calls_this_minute += 1
-            logger.debug(f"🌐 API call #{app_state.api_calls_this_minute} this minute -> {url}")
+            logger.debug(f"🌐 API call #{app_state.api_calls_this_minute} -> Fetching {len(batch)} tokens")
             
             async with app_state.http_session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 429:
@@ -217,14 +206,12 @@ async def get_dexscreener_data_batch(token_addresses: List[str]) -> Dict[str, Tu
                     await asyncio.sleep(60)
                     app_state.api_calls_this_minute = 0
                     app_state.last_minute_reset = datetime.now()
-                    # Mark all batch as unknown and continue
                     for addr in batch:
                         all_results[addr] = ("Unknown Token", 0.0, 0.0)
                     continue
                 
                 if resp.status != 200:
                     logger.warning(f"DexScreener batch returned status {resp.status}")
-                    # Mark all as failed
                     for addr in batch:
                         all_results[addr] = ("Unknown Token", 0.0, 0.0)
                     continue
@@ -241,7 +228,6 @@ async def get_dexscreener_data_batch(token_addresses: List[str]) -> Dict[str, Tu
                     if not token_addr:
                         continue
                     
-                    # Get token info
                     token_name = base_token.get('name') or base_token.get('symbol', 'Unknown Token')
                     try:
                         price_usd = float(pair.get('priceUsd', 0) or 0)
@@ -283,14 +269,6 @@ async def get_dexscreener_data_batch(token_addresses: List[str]) -> Dict[str, Tu
             await asyncio.sleep(app_state.config.rate_limit_delay)
     
     return all_results
-
-async def get_dexscreener_data(token_address: str) -> Tuple[str, float, float]:
-    """
-    Single token fetch (fallback for individual use)
-    For efficiency, use get_dexscreener_data_batch() instead
-    """
-    result = await get_dexscreener_data_batch([token_address])
-    return result.get(token_address, ("Unknown Token", 0.0, 0.0))
 
 # --- Milestone Tracking ---
 
@@ -340,13 +318,13 @@ def format_milestone_tracking(token: TokenMonitoring) -> str:
     
     return "\n".join(lines)
 
-# --- Sheet Operations (BATCHED) ---
+# --- Sheet Operations (THRESHOLD ONLY) ---
 
 def prepare_token_row_data(token: TokenMonitoring) -> List:
-    """Prepare row data for a token"""
+    """Prepare row data for a token - REDUCED COLUMNS"""
     profit_percent = 0.0
     if token.monitor_start_price > 0:
-        profit_percent = ((token.current_price / token.monitor_start_price) - 1) * 100
+        profit_percent = ((token.current_multiplier * token.monitor_start_price) / token.monitor_start_price - 1) * 100
     
     milestone_tracking = format_milestone_tracking(token)
     
@@ -354,20 +332,15 @@ def prepare_token_row_data(token: TokenMonitoring) -> List:
         token.token_name,
         token.status,
         f"{token.monitor_start_price:.8f}",
-        f"{token.current_price:.8f}",
         f"{token.monitor_start_market_cap:.0f}",
-        f"{token.current_market_cap:.0f}",
-        f"{token.highest_market_cap:.0f}",
         f"{token.current_multiplier:.2f}x",
-        f"{token.lowest_multiplier:.2f}x",
         f"{profit_percent:.1f}%",
         milestone_tracking
     ]
 
 def batch_update_tokens(tokens_to_update: List[TokenMonitoring]):
     """
-    CRITICAL FIX: Batch update multiple tokens in a SINGLE API call
-    This reduces API calls from N to 1, staying well under rate limits
+    THRESHOLD ONLY: Batch update only tokens that crossed milestones (Column A stays empty)
     """
     if not tokens_to_update:
         return
@@ -377,13 +350,14 @@ def batch_update_tokens(tokens_to_update: List[TokenMonitoring]):
         data = []
         for token in tokens_to_update:
             row_data = prepare_token_row_data(token)
-            range_str = f"{app_state.config.sheet_name}!B{token.row_index}:L{token.row_index}"
+            # Column A is empty, data starts from Column B
+            range_str = f"{app_state.config.sheet_name}!B{token.row_index}:I{token.row_index}"
             data.append({
                 'range': range_str,
                 'values': [row_data]
             })
         
-        # Single batchUpdate API call for all tokens
+        # Single batchUpdate API call
         body = {
             'valueInputOption': 'USER_ENTERED',
             'data': data
@@ -394,11 +368,10 @@ def batch_update_tokens(tokens_to_update: List[TokenMonitoring]):
             body=body
         ).execute()
         
-        logger.info(f"📝 Batch updated {len(tokens_to_update)} token(s) in sheet (1 API call)")
+        logger.info(f"📝 Batch updated {len(tokens_to_update)} token(s) that crossed thresholds")
         
         # Mark tokens as updated
         for token in tokens_to_update:
-            token.needs_update = False
             token.initial_write_done = True
     
     except HttpError as e:
@@ -413,7 +386,7 @@ def batch_update_tokens(tokens_to_update: List[TokenMonitoring]):
 # --- Token Scanning ---
 
 def scan_for_new_tokens() -> List[Tuple[int, str]]:
-    """Scan Column A for new token addresses"""
+    """Scan Column B for new token addresses (Column A is left empty)"""
     try:
         range_str = f"{app_state.config.sheet_name}!B2:B"
         result = app_state.sheets_service.spreadsheets().values().get(
@@ -443,12 +416,9 @@ def scan_for_new_tokens() -> List[Tuple[int, str]]:
 
 # --- Monitoring Logic ---
 
-async def start_monitoring_token(row_index: int, token_address: str):
-    """Initialize monitoring for a new token"""
-    logger.info(f"🆕 Starting monitoring: Row {row_index} | {token_address[:8]}...")
-    
-    # Get initial data from DexScreener (single call is fine for initialization)
-    token_name, price, market_cap = await get_dexscreener_data(token_address)
+async def start_monitoring_token(row_index: int, token_address: str, initial_price_data: Tuple[str, float, float]):
+    """Initialize monitoring for a new token using already-fetched price data"""
+    token_name, price, market_cap = initial_price_data
     
     if price == 0:
         logger.error(f"❌ Could not get price for {token_address[:8]}")
@@ -461,18 +431,11 @@ async def start_monitoring_token(row_index: int, token_address: str):
         token_name=token_name,
         status="MONITORING",
         monitor_start_price=price,
-        current_price=price,
-        highest_price=price,
-        lowest_price=price,
         monitor_start_market_cap=market_cap,
-        current_market_cap=market_cap,
-        highest_market_cap=market_cap,
         current_multiplier=1.0,
-        highest_multiplier=1.0,
-        lowest_multiplier=1.0,
         last_updated=datetime.now(),
         initial_write_done=False,
-        needs_update=True  # Mark for initial write
+        has_crossed_threshold=False
     )
     
     # Add to monitored tokens
@@ -481,89 +444,76 @@ async def start_monitoring_token(row_index: int, token_address: str):
     
     logger.info(f"✅ Monitoring started: {token_name} | ${price:.8f} | MC: ${market_cap:.0f}")
 
-async def update_token_prices_batch(tokens: List[TokenMonitoring]):
+async def update_all_tokens_and_check_thresholds(price_data: Dict[str, Tuple[str, float, float]]):
     """
-    OPTIMIZED: Update multiple tokens in a single batch API call
+    Process ALL token updates from batch price fetch
+    Only mark tokens that crossed thresholds for sheet update
     """
-    if not tokens:
-        return
+    tokens_crossing_threshold = []
     
-    # Get all token addresses
-    token_addresses = [t.token_address for t in tokens]
-    
-    # Fetch all prices in one batch call
-    batch_results = await get_dexscreener_data_batch(token_addresses)
-    
-    # Process each token's results
-    for token in tokens:
-        try:
-            token_name, price, market_cap = batch_results.get(
-                token.token_address, 
-                ("Unknown Token", 0.0, 0.0)
-            )
-            
-            if price == 0:
-                logger.warning(f"⚠️ Failed to get price for {token.token_name or token.token_address[:8]}")
-                continue
-            
-            # Store previous multiplier
-            old_multiplier = token.current_multiplier
-            
-            # Update current data
-            token.current_price = price
-            token.current_market_cap = market_cap
-            token.last_updated = datetime.now()
-            
-            # Update name if we got a better one
-            if token_name != "Unknown Token" and not token.token_name:
-                token.token_name = token_name
-            
-            # Calculate current multiplier
-            if token.monitor_start_price > 0:
-                token.current_multiplier = token.current_price / token.monitor_start_price
-            
-            # Update highest/lowest
-            if token.current_price > token.highest_price:
-                token.highest_price = token.current_price
-                token.highest_market_cap = market_cap
-                token.highest_multiplier = token.current_multiplier
-            
-            if token.current_price < token.lowest_price:
-                token.lowest_price = token.current_price
-                token.lowest_multiplier = token.current_multiplier
-            
-            # Check for crossed milestones
-            crossed_milestones = find_crossed_milestones(old_multiplier, token.current_multiplier)
-            
-            # Mark for update if milestones were crossed
-            if crossed_milestones:
-                for milestone_value, direction in crossed_milestones:
-                    milestone = MultiplierMilestone(
-                        timestamp=datetime.now(),
-                        multiplier=milestone_value,
-                        direction=direction,
-                        price=token.current_price,
-                        market_cap=token.current_market_cap
-                    )
-                    token.milestone_history.append(milestone)
-                    
-                    emoji = "📈" if direction == "UP" else "📉"
-                    logger.info(
-                        f"{emoji} {token.token_name or token.token_address[:8]} crossed {milestone_value:.2f}x {direction} | "
-                        f"Current: {token.current_multiplier:.2f}x | Price: ${price:.8f}"
-                    )
+    with app_state._lock:
+        for token_address, token in app_state.monitored_tokens.items():
+            try:
+                # Get price data from batch fetch
+                if token_address not in price_data:
+                    logger.warning(f"⚠️ No price data for {token.token_name or token_address[:8]}")
+                    continue
                 
-                token.needs_update = True  # Mark for batched update
-            else:
-                logger.debug(f"👀 {token.token_name or token.token_address[:8]}: {token.current_multiplier:.4f}x")
-        
-        except Exception as e:
-            logger.error(f"Error processing {token.token_name or token.token_address[:8]}: {e}")
+                token_name, price, market_cap = price_data[token_address]
+                
+                if price == 0:
+                    logger.warning(f"⚠️ Zero price for {token.token_name or token_address[:8]}")
+                    continue
+                
+                # Store previous multiplier
+                old_multiplier = token.current_multiplier
+                
+                # Update token name if we got a better one
+                if token_name != "Unknown Token" and not token.token_name:
+                    token.token_name = token_name
+                
+                # Calculate current multiplier
+                if token.monitor_start_price > 0:
+                    token.current_multiplier = price / token.monitor_start_price
+                
+                token.last_updated = datetime.now()
+                
+                # Check for crossed milestones
+                crossed_milestones = find_crossed_milestones(old_multiplier, token.current_multiplier)
+                
+                # THRESHOLD CHECK: Only update sheet if milestones were crossed
+                if crossed_milestones:
+                    for milestone_value, direction in crossed_milestones:
+                        milestone = MultiplierMilestone(
+                            timestamp=datetime.now(),
+                            multiplier=milestone_value,
+                            direction=direction,
+                            price=price,
+                            market_cap=market_cap
+                        )
+                        token.milestone_history.append(milestone)
+                        
+                        emoji = "📈" if direction == "UP" else "📉"
+                        logger.info(
+                            f"{emoji} {token.token_name or token_address[:8]} crossed {milestone_value:.2f}x {direction} | "
+                            f"Current: {token.current_multiplier:.2f}x | Price: ${price:.8f}"
+                        )
+                    
+                    token.has_crossed_threshold = True
+                    tokens_crossing_threshold.append(token)
+                else:
+                    # Just log for monitoring
+                    logger.debug(f"👀 {token.token_name or token_address[:8]}: {token.current_multiplier:.4f}x")
+            
+            except Exception as e:
+                logger.error(f"Error processing {token.token_name or token_address[:8]}: {e}")
+    
+    return tokens_crossing_threshold
 
 # --- Main Loop ---
 
 async def monitoring_loop():
-    """Main monitoring loop with batched updates"""
+    """Main monitoring loop with single batch price fetch per tick"""
     logger.info("🔄 Starting monitoring loop...")
     
     while True:
@@ -573,37 +523,33 @@ async def monitoring_loop():
             # Step 1: Scan for new tokens
             new_tokens = scan_for_new_tokens()
             
+            # Step 2: SINGLE BATCH PRICE FETCH FOR ALL TOKENS (including new ones)
+            # Add new tokens to the list temporarily to get their initial prices
+            temp_addresses = {}
             if new_tokens:
-                logger.info(f"📥 Found {len(new_tokens)} new token(s)")
                 for row_index, token_address in new_tokens:
-                    await start_monitoring_token(row_index, token_address)
+                    temp_addresses[token_address] = row_index
             
-            # Step 2: Update all monitored tokens IN ONE BATCH
-            with app_state._lock:
-                tokens_to_monitor = list(app_state.monitored_tokens.values())
+            # Fetch ALL prices in one batch
+            logger.info(f"👀 Tick #{app_state.tick_counter}: Fetching prices for ALL tokens in batch...")
+            price_data = await get_all_token_prices_batch()
             
-            if tokens_to_monitor:
-                logger.info(f"👀 Tick #{app_state.tick_counter}: Batch updating {len(tokens_to_monitor)} token(s)...")
-                # SINGLE batch call for ALL tokens instead of N individual calls
-                await update_token_prices_batch(tokens_to_monitor)
+            # Step 3: Initialize new tokens using fetched data
+            if new_tokens:
+                logger.info(f"📥 Initializing {len(new_tokens)} new token(s)...")
+                for row_index, token_address in new_tokens:
+                    if token_address in price_data:
+                        await start_monitoring_token(row_index, token_address, price_data[token_address])
             
-            # Step 3: BATCH UPDATE - Only tokens that need it
-            with app_state._lock:
-                # Tokens that crossed milestones or need initial write
-                tokens_needing_update = [
-                    t for t in app_state.monitored_tokens.values() 
-                    if t.needs_update or not t.initial_write_done
-                ]
-                
-                # Force update all tokens periodically (every N ticks)
-                force_update = (app_state.tick_counter % app_state.config.batch_update_interval) == 0
-                
-                if force_update and tokens_to_monitor:
-                    logger.info(f"🔄 Periodic update: Refreshing all {len(tokens_to_monitor)} tokens")
-                    batch_update_tokens(tokens_to_monitor)
-                elif tokens_needing_update:
-                    logger.info(f"📝 Updating {len(tokens_needing_update)} token(s) with changes")
-                    batch_update_tokens(tokens_needing_update)
+            # Step 4: Update ALL monitored tokens and check for threshold crossings
+            tokens_to_update = await update_all_tokens_and_check_thresholds(price_data)
+            
+            # Step 5: BATCH UPDATE - Only tokens that crossed thresholds
+            if tokens_to_update:
+                logger.info(f"📝 {len(tokens_to_update)} token(s) crossed thresholds, updating sheet...")
+                batch_update_tokens(tokens_to_update)
+            else:
+                logger.debug("✅ No threshold crossings this tick")
             
             # Wait before next tick
             await asyncio.sleep(app_state.config.tick_interval_seconds)
@@ -616,7 +562,7 @@ async def monitoring_loop():
 
 async def main_async():
     """Main async application"""
-    logger.info("🚀 Starting Solana Token Monitor (DexScreener + Batched Updates)...")
+    logger.info("🚀 Starting Solana Token Monitor (Optimized Batch + Threshold Only)...")
     
     app_state.config = load_config()
     initialize_services()
@@ -626,19 +572,14 @@ async def main_async():
     # Test DexScreener
     logger.info("🧪 Testing DexScreener API...")
     try:
-        test_token = "So11111111111111111111111111111111111111112"
-        name, price, mc = await get_dexscreener_data(test_token)
-        if price > 0:
-            logger.info(f"✅ DexScreener API test passed: SOL = ${price:.2f}")
-        else:
-            logger.warning("⚠️ DexScreener API returned zero price for test token.")
+        test_price_data = await get_all_token_prices_batch()
+        logger.info("✅ DexScreener API test passed")
     except Exception as e:
-        logger.warning(f"DexScreener test failed: {e}")
+        logger.warning(f"DexScreener test warning: {e}")
     
     logger.info(f"🔄 Starting main loop (tick: {app_state.config.tick_interval_seconds}s)...")
-    logger.info("📝 Using BATCHED updates to avoid rate limits")
-    logger.info(f"🌐 DexScreener: Max {app_state.config.max_requests_per_minute} requests/min")
-    logger.info(f"💡 With batching: Can monitor up to {app_state.config.max_requests_per_minute * 30} tokens!")
+    logger.info("📝 THRESHOLD-ONLY MODE: Sheet updates only on milestone crossings")
+    logger.info("🌐 BATCH MODE: All token prices fetched in single API call per tick")
     
     try:
         await monitoring_loop()
