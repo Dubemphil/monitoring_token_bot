@@ -442,6 +442,9 @@ async def start_monitoring_token(row_index: int, token_address: str, initial_pri
     with app_state._lock:
         app_state.monitored_tokens[token_address] = token
     
+    # IMMEDIATE INITIAL WRITE: Write to sheet as soon as monitoring starts
+    batch_update_tokens([token])
+    
     logger.info(f"✅ Monitoring started: {token_name} | ${price:.8f} | MC: ${market_cap:.0f}")
 
 async def update_all_tokens_and_check_thresholds(price_data: Dict[str, Tuple[str, float, float]]):
