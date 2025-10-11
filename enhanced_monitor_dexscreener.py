@@ -2,6 +2,7 @@
 """
 Enhanced Solana Token Monitoring Bot - DexScreener Real-Time Version.
 OPTIMIZED: Batch price fetching, threshold-only updates, reduced columns.
+FIXED: Token address preservation, accurate initial multiplier
 """
 
 import os
@@ -327,26 +328,32 @@ def format_milestone_tracking(token: TokenMonitoring) -> str:
 # --- Sheet Operations (THRESHOLD ONLY) ---
 
 def prepare_token_row_data(token: TokenMonitoring) -> List:
-    """Prepare row data for a token - REDUCED COLUMNS"""
+    """
+    FIXED: Prepare row data for a token - Token Name goes to Column C (not B)
+    Column B remains the token address (preserved from scan)
+    """
     profit_percent = 0.0
     if token.monitor_start_price > 0:
-        profit_percent = ((token.current_multiplier * token.monitor_start_price) / token.monitor_start_price - 1) * 100
+        current_price = token.current_multiplier * token.monitor_start_price
+        profit_percent = ((current_price / token.monitor_start_price) - 1) * 100
     
     milestone_tracking = format_milestone_tracking(token)
     
+    # Return data for columns C through I (B is skipped to preserve token address)
     return [
-        token.token_name,
-        token.status,
-        f"{token.monitor_start_price:.8f}",
-        f"{token.monitor_start_market_cap:.0f}",
-        f"{token.current_multiplier:.2f}x",
-        f"{profit_percent:.1f}%",
-        milestone_tracking
+        token.token_name,  # Column C
+        token.status,  # Column D
+        f"{token.monitor_start_price:.8f}",  # Column E
+        f"{token.monitor_start_market_cap:.0f}",  # Column F
+        f"{token.current_multiplier:.2f}x",  # Column G
+        f"{profit_percent:.1f}%",  # Column H
+        milestone_tracking  # Column I
     ]
 
 def batch_update_tokens(tokens_to_update: List[TokenMonitoring]):
     """
-    THRESHOLD ONLY: Batch update only tokens that crossed milestones (Column A stays empty)
+    THRESHOLD ONLY: Batch update only tokens that crossed milestones
+    FIXED: Write to columns C-I, leaving B (token address) untouched
     """
     if not tokens_to_update:
         return
@@ -356,8 +363,8 @@ def batch_update_tokens(tokens_to_update: List[TokenMonitoring]):
         data = []
         for token in tokens_to_update:
             row_data = prepare_token_row_data(token)
-            # Column A is empty, data starts from Column B
-            range_str = f"{app_state.config.sheet_name}!B{token.row_index}:I{token.row_index}"
+            # Column B is SKIPPED - data goes to C through I
+            range_str = f"{app_state.config.sheet_name}!C{token.row_index}:I{token.row_index}"
             data.append({
                 'range': range_str,
                 'values': [row_data]
@@ -423,7 +430,10 @@ def scan_for_new_tokens() -> List[Tuple[int, str]]:
 # --- Monitoring Logic ---
 
 async def start_monitoring_token(row_index: int, token_address: str, initial_price_data: Tuple[str, float, float]):
-    """Initialize monitoring for a new token using already-fetched price data"""
+    """
+    FIXED: Initialize monitoring for a new token using already-fetched price data
+    Current multiplier always starts at 1.0x
+    """
     token_name, price, market_cap = initial_price_data
     
     logger.info(f"🔍 Attempting to start monitoring: Row {row_index} | {token_address[:8]}... | Price: ${price:.8f}")
@@ -432,15 +442,15 @@ async def start_monitoring_token(row_index: int, token_address: str, initial_pri
         logger.error(f"❌ Could not get price for {token_address[:8]} - price is 0")
         return
     
-    # Create token monitoring object
+    # Create token monitoring object - MULTIPLIER ALWAYS STARTS AT 1.0
     token = TokenMonitoring(
         row_index=row_index,
         token_address=token_address,
         token_name=token_name,
         status="MONITORING",
-        monitor_start_price=price,
+        monitor_start_price=price,  # This is the baseline
         monitor_start_market_cap=market_cap,
-        current_multiplier=1.0,
+        current_multiplier=1.0,  # ALWAYS start at 1.0x
         last_updated=datetime.now(),
         initial_write_done=False,
         has_crossed_threshold=False
@@ -450,7 +460,7 @@ async def start_monitoring_token(row_index: int, token_address: str, initial_pri
     with app_state._lock:
         app_state.monitored_tokens[token_address] = token
     
-    logger.info(f"✅ Token added to monitoring list: {token_name} (Total: {len(app_state.monitored_tokens)})")
+    logger.info(f"✅ Token added to monitoring list: {token_name} at {price:.8f} (Multiplier: 1.0x) (Total: {len(app_state.monitored_tokens)})")
     
     # IMMEDIATE INITIAL WRITE: Write to sheet as soon as monitoring starts
     try:
@@ -489,9 +499,12 @@ async def update_all_tokens_and_check_thresholds(price_data: Dict[str, Tuple[str
                 if token_name != "Unknown Token" and not token.token_name:
                     token.token_name = token_name
                 
-                # Calculate current multiplier
+                # Calculate current multiplier relative to START price
                 if token.monitor_start_price > 0:
                     token.current_multiplier = price / token.monitor_start_price
+                else:
+                    logger.error(f"⚠️ Token {token.token_name} has zero start price!")
+                    continue
                 
                 token.last_updated = datetime.now()
                 
@@ -584,7 +597,7 @@ async def monitoring_loop():
 
 async def main_async():
     """Main async application"""
-    logger.info("🚀 Starting Solana Token Monitor (Optimized Batch + Threshold Only)...")
+    logger.info("🚀 Starting Solana Token Monitor (FIXED: Address Preservation + Accurate Multiplier)...")
     
     app_state.config = load_config()
     initialize_services()
@@ -602,6 +615,8 @@ async def main_async():
     logger.info(f"🔄 Starting main loop (tick: {app_state.config.tick_interval_seconds}s)...")
     logger.info("📝 THRESHOLD-ONLY MODE: Sheet updates only on milestone crossings")
     logger.info("🌐 BATCH MODE: All token prices fetched in single API call per tick")
+    logger.info("✅ FIXED: Token addresses preserved in Column B")
+    logger.info("✅ FIXED: Multiplier always starts at 1.0x")
     
     try:
         await monitoring_loop()
