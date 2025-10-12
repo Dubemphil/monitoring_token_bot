@@ -3,6 +3,7 @@
 Enhanced Solana Token Monitoring Bot - DexScreener Real-Time Version.
 OPTIMIZED: Batch price fetching, threshold-only updates, reduced columns.
 FIXED: Token address preservation, accurate initial multiplier
+MODIFIED: Date header in Column A, Highest Multiplier tracking
 """
 
 import os
@@ -59,6 +60,7 @@ class TokenMonitoring:
     monitor_start_price: float = 0.0
     monitor_start_market_cap: float = 0.0
     current_multiplier: float = 1.0
+    highest_multiplier: float = 1.0  # NEW: Track highest multiplier reached
     last_updated: Optional[datetime] = None
     milestone_history: List[MultiplierMilestone] = field(default_factory=list)
     last_logged_milestone: float = 0.0
@@ -138,10 +140,10 @@ def initialize_services():
     logger.info("✅ Google Sheets service initialized")
 
 def ensure_sheet_headers():
-    """Create headers for the monitoring sheet - REDUCED COLUMNS (Column A left empty)"""
+    """Create headers for the monitoring sheet - Column A has 'Date' header"""
     headers = [[
-        "", "Token Address", "Token Name", "Status", "Start Price", 
-        "Start MC", "Current Multiplier", "Profit %", "Multiplier Tracking"
+        "Date", "Token Address", "Token Name", "Status", "Start Price", 
+        "Start MC", "Highest Multiplier", "Profit %", "Multiplier Tracking"
     ]]
     
     range_str = f"{app_state.config.sheet_name}!A1:I1"
@@ -154,7 +156,7 @@ def ensure_sheet_headers():
             valueInputOption='RAW',
             body=body
         ).execute()
-        logger.info("✅ Sheet headers ensured (Column A empty)")
+        logger.info("✅ Sheet headers ensured (Column A: Date)")
     except HttpError as e:
         logger.error(f"Failed to create headers: {e}")
 
@@ -345,7 +347,7 @@ def prepare_token_row_data(token: TokenMonitoring) -> List:
         token.status,  # Column D
         f"{token.monitor_start_price:.8f}",  # Column E
         f"{token.monitor_start_market_cap:.0f}",  # Column F
-        f"{token.current_multiplier:.2f}x",  # Column G
+        f"{token.highest_multiplier:.2f}x",  # Column G - CHANGED to highest_multiplier
         f"{profit_percent:.1f}%",  # Column H
         milestone_tracking  # Column I
     ]
@@ -451,6 +453,7 @@ async def start_monitoring_token(row_index: int, token_address: str, initial_pri
         monitor_start_price=price,  # This is the baseline
         monitor_start_market_cap=market_cap,
         current_multiplier=1.0,  # ALWAYS start at 1.0x
+        highest_multiplier=1.0,  # ALWAYS start at 1.0x
         last_updated=datetime.now(),
         initial_write_done=False,
         has_crossed_threshold=False
@@ -506,6 +509,10 @@ async def update_all_tokens_and_check_thresholds(price_data: Dict[str, Tuple[str
                     logger.error(f"⚠️ Token {token.token_name} has zero start price!")
                     continue
                 
+                # Update highest multiplier if current exceeds it
+                if token.current_multiplier > token.highest_multiplier:
+                    token.highest_multiplier = token.current_multiplier
+                
                 token.last_updated = datetime.now()
                 
                 # Check for crossed milestones
@@ -526,7 +533,7 @@ async def update_all_tokens_and_check_thresholds(price_data: Dict[str, Tuple[str
                         emoji = "📈" if direction == "UP" else "📉"
                         logger.info(
                             f"{emoji} {token.token_name or token_address[:8]} crossed {milestone_value:.2f}x {direction} | "
-                            f"Current: {token.current_multiplier:.2f}x | Price: ${price:.8f}"
+                            f"Current: {token.current_multiplier:.2f}x | Highest: {token.highest_multiplier:.2f}x | Price: ${price:.8f}"
                         )
                     
                     token.has_crossed_threshold = True
@@ -597,7 +604,7 @@ async def monitoring_loop():
 
 async def main_async():
     """Main async application"""
-    logger.info("🚀 Starting Solana Token Monitor (FIXED: Address Preservation + Accurate Multiplier)...")
+    logger.info("🚀 Starting Solana Token Monitor (MODIFIED: Date header + Highest Multiplier)...")
     
     app_state.config = load_config()
     initialize_services()
@@ -615,8 +622,8 @@ async def main_async():
     logger.info(f"🔄 Starting main loop (tick: {app_state.config.tick_interval_seconds}s)...")
     logger.info("📝 THRESHOLD-ONLY MODE: Sheet updates only on milestone crossings")
     logger.info("🌐 BATCH MODE: All token prices fetched in single API call per tick")
-    logger.info("✅ FIXED: Token addresses preserved in Column B")
-    logger.info("✅ FIXED: Multiplier always starts at 1.0x")
+    logger.info("✅ MODIFIED: Column A has 'Date' header (populated by another script)")
+    logger.info("✅ MODIFIED: Tracking highest multiplier reached")
     
     try:
         await monitoring_loop()
