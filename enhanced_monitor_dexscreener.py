@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
 Enhanced Solana Token Monitoring Bot - DexScreener Real-Time Version.
-OPTIMIZED: Batch price fetching, threshold-only updates, reduced columns.
-FIXED: Token address preservation, accurate initial multiplier
-MODIFIED: Date header in Column A, Highest Multiplier tracking
+FIXED: Token address preservation, accurate multiplier calculation, improved initial price handling
 """
 
 import os
@@ -60,12 +58,12 @@ class TokenMonitoring:
     monitor_start_price: float = 0.0
     monitor_start_market_cap: float = 0.0
     current_multiplier: float = 1.0
-    highest_multiplier: float = 1.0  # NEW: Track highest multiplier reached
+    highest_multiplier: float = 1.0
     last_updated: Optional[datetime] = None
     milestone_history: List[MultiplierMilestone] = field(default_factory=list)
     last_logged_milestone: float = 0.0
     initial_write_done: bool = False
-    has_crossed_threshold: bool = False  # NEW: Track if threshold crossed
+    has_crossed_threshold: bool = False
 
 @dataclass
 class Config:
@@ -160,17 +158,16 @@ def ensure_sheet_headers():
     except HttpError as e:
         logger.error(f"Failed to create headers: {e}")
 
-# --- DexScreener Price Fetching (SINGLE BATCH CALL) ---
+# --- DexScreener Price Fetching ---
 
 async def get_all_token_prices_batch(additional_addresses: List[str] = None) -> Dict[str, Tuple[str, float, float]]:
     """
-    OPTIMIZED: Fetch ALL monitored tokens + new tokens in MINIMUM API calls
+    Fetch ALL monitored tokens + new tokens in batch API calls
     Returns dict: {token_address: (name, price, market_cap)}
     """
     with app_state._lock:
         token_addresses = list(app_state.monitored_tokens.keys())
     
-    # Add new tokens that aren't monitored yet
     if additional_addresses:
         for addr in additional_addresses:
             if addr not in token_addresses:
@@ -186,7 +183,6 @@ async def get_all_token_prices_batch(additional_addresses: List[str] = None) -> 
         app_state.last_minute_reset = now
         logger.debug("✅ Rate limit counter reset")
     
-    # DexScreener supports up to 30 tokens per request
     batch_size = 30
     all_results: Dict[str, Tuple[str, float, float]] = {}
     
@@ -228,7 +224,6 @@ async def get_all_token_prices_batch(additional_addresses: List[str] = None) -> 
                 data = await resp.json()
                 pairs_list = data if isinstance(data, list) else data.get('pairs', [])
                 
-                # Create a map of token addresses to their best pair data
                 token_data_map: Dict[str, Tuple[str, float, float, float]] = {}
                 for pair in pairs_list:
                     base_token = pair.get('baseToken', {})
@@ -251,18 +246,17 @@ async def get_all_token_prices_batch(additional_addresses: List[str] = None) -> 
                     except (TypeError, ValueError):
                         liquidity = 0.0
                     
-                    # Keep the pair with highest liquidity for each token
                     if token_addr not in token_data_map or liquidity > token_data_map[token_addr][3]:
                         token_data_map[token_addr] = (token_name, price_usd, market_cap, liquidity)
                 
-                # Map results back to requested addresses
                 for addr in batch:
                     if addr in token_data_map:
                         name, price, mc, _ = token_data_map[addr]
                         all_results[addr] = (name, price, mc)
+                        logger.debug(f"   ✓ {name} ({addr[:8]}): ${price:.10f} | MC: ${mc:.0f}")
                     else:
                         all_results[addr] = ("Unknown Token", 0.0, 0.0)
-                        logger.warning(f"No data found for {addr[:8]}")
+                        logger.warning(f"   ✗ No data found for {addr[:8]}")
         
         except asyncio.TimeoutError:
             logger.warning(f"Timeout fetching batch of {len(batch)} tokens")
@@ -273,7 +267,6 @@ async def get_all_token_prices_batch(additional_addresses: List[str] = None) -> 
             for addr in batch:
                 all_results[addr] = ("Unknown Token", 0.0, 0.0)
         
-        # Small delay between batches if needed
         if i + batch_size < len(token_addresses):
             await asyncio.sleep(app_state.config.rate_limit_delay)
     
@@ -322,17 +315,17 @@ def format_milestone_tracking(token: TokenMonitoring) -> str:
         time_str = milestone.timestamp.strftime("%H:%M:%S")
         lines.append(
             f"{emoji} {time_str} | {milestone.multiplier:.2f}x | "
-            f"${milestone.price:.8f} | MC: ${milestone.market_cap:.0f}"
+            f"${milestone.price:.10f} | MC: ${milestone.market_cap:.0f}"
         )
     
     return "\n".join(lines)
 
-# --- Sheet Operations (THRESHOLD ONLY) ---
+# --- Sheet Operations ---
 
 def prepare_token_row_data(token: TokenMonitoring) -> List:
     """
-    FIXED: Prepare row data for a token - Token Name goes to Column C (not B)
-    Column B remains the token address (preserved from scan)
+    Prepare row data for columns C through I (Column B is token address - NEVER touched)
+    Returns: [Token Name, Status, Start Price, Start MC, Highest Multiplier, Profit %, Milestone Tracking]
     """
     profit_percent = 0.0
     if token.monitor_start_price > 0:
@@ -341,38 +334,35 @@ def prepare_token_row_data(token: TokenMonitoring) -> List:
     
     milestone_tracking = format_milestone_tracking(token)
     
-    # Return data for columns C through I (B is skipped to preserve token address)
     return [
         token.token_name,  # Column C
         token.status,  # Column D
-        f"{token.monitor_start_price:.8f}",  # Column E
+        f"{token.monitor_start_price:.10f}",  # Column E (increased precision)
         f"{token.monitor_start_market_cap:.0f}",  # Column F
-        f"{token.highest_multiplier:.2f}x",  # Column G - CHANGED to highest_multiplier
+        f"{token.highest_multiplier:.2f}x",  # Column G
         f"{profit_percent:.1f}%",  # Column H
         milestone_tracking  # Column I
     ]
 
 def batch_update_tokens(tokens_to_update: List[TokenMonitoring]):
     """
-    THRESHOLD ONLY: Batch update only tokens that crossed milestones
-    FIXED: Write to columns C-I, leaving B (token address) untouched
+    Batch update only tokens that need updating
+    CRITICAL: Updates ONLY columns C-I, NEVER touches Column B (token address)
     """
     if not tokens_to_update:
         return
     
     try:
-        # Prepare batch update data
         data = []
         for token in tokens_to_update:
             row_data = prepare_token_row_data(token)
-            # Column B is SKIPPED - data goes to C through I
+            # EXPLICIT: C through I only - B is NEVER touched
             range_str = f"{app_state.config.sheet_name}!C{token.row_index}:I{token.row_index}"
             data.append({
                 'range': range_str,
                 'values': [row_data]
             })
         
-        # Single batchUpdate API call
         body = {
             'valueInputOption': 'USER_ENTERED',
             'data': data
@@ -383,9 +373,8 @@ def batch_update_tokens(tokens_to_update: List[TokenMonitoring]):
             body=body
         ).execute()
         
-        logger.info(f"📝 Batch updated {len(tokens_to_update)} token(s) that crossed thresholds")
+        logger.info(f"📝 Batch updated {len(tokens_to_update)} token(s) - Column B preserved")
         
-        # Mark tokens as updated
         for token in tokens_to_update:
             token.initial_write_done = True
     
@@ -401,7 +390,7 @@ def batch_update_tokens(tokens_to_update: List[TokenMonitoring]):
 # --- Token Scanning ---
 
 def scan_for_new_tokens() -> List[Tuple[int, str]]:
-    """Scan Column B for new token addresses (Column A is left empty)"""
+    """Scan Column B for new token addresses"""
     try:
         range_str = f"{app_state.config.sheet_name}!B2:B"
         result = app_state.sheets_service.spreadsheets().values().get(
@@ -433,124 +422,131 @@ def scan_for_new_tokens() -> List[Tuple[int, str]]:
 
 async def start_monitoring_token(row_index: int, token_address: str, initial_price_data: Tuple[str, float, float]):
     """
-    FIXED: Initialize monitoring for a new token using already-fetched price data
-    Current multiplier always starts at 1.0x
+    Initialize monitoring for a new token
+    FIXED: Ensures accurate initial price capture and multiplier calculation
     """
     token_name, price, market_cap = initial_price_data
     
-    logger.info(f"🔍 Attempting to start monitoring: Row {row_index} | {token_address[:8]}... | Price: ${price:.8f}")
+    logger.info(f"🔍 Starting monitoring: Row {row_index} | {token_address[:8]}...")
+    logger.info(f"   Initial Price: ${price:.10f} | MC: ${market_cap:.0f}")
     
     if price == 0:
-        logger.error(f"❌ Could not get price for {token_address[:8]} - price is 0")
+        logger.error(f"❌ Cannot monitor {token_address[:8]} - price is 0")
         return
     
-    # Create token monitoring object - MULTIPLIER ALWAYS STARTS AT 1.0
+    # Create token monitoring object
     token = TokenMonitoring(
         row_index=row_index,
         token_address=token_address,
         token_name=token_name,
         status="MONITORING",
-        monitor_start_price=price,  # This is the baseline
+        monitor_start_price=price,  # This is the baseline price
         monitor_start_market_cap=market_cap,
-        current_multiplier=1.0,  # ALWAYS start at 1.0x
-        highest_multiplier=1.0,  # ALWAYS start at 1.0x
+        current_multiplier=1.0,  # Always starts at 1.0x
+        highest_multiplier=1.0,
         last_updated=datetime.now(),
         initial_write_done=False,
         has_crossed_threshold=False
     )
     
-    # Add to monitored tokens FIRST
+    # Add to monitored tokens
     with app_state._lock:
         app_state.monitored_tokens[token_address] = token
     
-    logger.info(f"✅ Token added to monitoring list: {token_name} at {price:.8f} (Multiplier: 1.0x) (Total: {len(app_state.monitored_tokens)})")
+    logger.info(f"✅ Added to monitoring: {token_name} | Baseline: ${price:.10f} | Multiplier: 1.0x")
+    logger.info(f"   Total monitored: {len(app_state.monitored_tokens)}")
     
-    # IMMEDIATE INITIAL WRITE: Write to sheet as soon as monitoring starts
+    # Initial write to sheet
     try:
         batch_update_tokens([token])
-        logger.info(f"📝 Initial write completed for {token_name}")
+        logger.info(f"📝 Initial sheet write completed for {token_name}")
     except Exception as e:
-        logger.error(f"❌ Failed to write initial data for {token_name}: {e}")
-    
-    logger.info(f"✅ Monitoring fully started: {token_name} | ${price:.8f} | MC: ${market_cap:.0f}")
+        logger.error(f"❌ Failed initial write for {token_name}: {e}")
 
 async def update_all_tokens_and_check_thresholds(price_data: Dict[str, Tuple[str, float, float]]):
     """
-    Process ALL token updates from batch price fetch
-    Only mark tokens that crossed thresholds for sheet update
+    Process ALL token updates and check for milestone crossings
+    FIXED: Accurate multiplier calculation with detailed logging
     """
     tokens_crossing_threshold = []
     
     with app_state._lock:
         for token_address, token in app_state.monitored_tokens.items():
             try:
-                # Get price data from batch fetch
                 if token_address not in price_data:
                     logger.warning(f"⚠️ No price data for {token.token_name or token_address[:8]}")
                     continue
                 
-                token_name, price, market_cap = price_data[token_address]
+                token_name, current_price, market_cap = price_data[token_address]
                 
-                if price == 0:
+                if current_price == 0:
                     logger.warning(f"⚠️ Zero price for {token.token_name or token_address[:8]}")
                     continue
+                
+                # Update token name if we have a better one
+                if token_name != "Unknown Token" and not token.token_name:
+                    token.token_name = token_name
                 
                 # Store previous multiplier
                 old_multiplier = token.current_multiplier
                 
-                # Update token name if we got a better one
-                if token_name != "Unknown Token" and not token.token_name:
-                    token.token_name = token_name
-                
-                # Calculate current multiplier relative to START price
-                if token.monitor_start_price > 0:
-                    token.current_multiplier = price / token.monitor_start_price
-                else:
-                    logger.error(f"⚠️ Token {token.token_name} has zero start price!")
+                # CRITICAL: Calculate multiplier relative to START price
+                if token.monitor_start_price <= 0:
+                    logger.error(f"⚠️ Token {token.token_name} has invalid start price: {token.monitor_start_price}")
                     continue
                 
-                # Update highest multiplier if current exceeds it
+                # Calculate new multiplier
+                token.current_multiplier = current_price / token.monitor_start_price
+                
+                # Detailed logging for verification
+                logger.debug(f"📊 {token.token_name or token_address[:8]}:")
+                logger.debug(f"   Start Price: ${token.monitor_start_price:.10f}")
+                logger.debug(f"   Current Price: ${current_price:.10f}")
+                logger.debug(f"   Multiplier: {token.current_multiplier:.4f}x (was {old_multiplier:.4f}x)")
+                
+                # Update highest multiplier
                 if token.current_multiplier > token.highest_multiplier:
+                    old_highest = token.highest_multiplier
                     token.highest_multiplier = token.current_multiplier
+                    logger.info(f"🎯 NEW HIGH: {token.token_name} reached {token.highest_multiplier:.2f}x (was {old_highest:.2f}x)")
                 
                 token.last_updated = datetime.now()
                 
                 # Check for crossed milestones
                 crossed_milestones = find_crossed_milestones(old_multiplier, token.current_multiplier)
                 
-                # THRESHOLD CHECK: Only update sheet if milestones were crossed
                 if crossed_milestones:
                     for milestone_value, direction in crossed_milestones:
                         milestone = MultiplierMilestone(
                             timestamp=datetime.now(),
                             multiplier=milestone_value,
                             direction=direction,
-                            price=price,
+                            price=current_price,
                             market_cap=market_cap
                         )
                         token.milestone_history.append(milestone)
                         
                         emoji = "📈" if direction == "UP" else "📉"
                         logger.info(
-                            f"{emoji} {token.token_name or token_address[:8]} crossed {milestone_value:.2f}x {direction} | "
-                            f"Current: {token.current_multiplier:.2f}x | Highest: {token.highest_multiplier:.2f}x | Price: ${price:.8f}"
+                            f"{emoji} MILESTONE: {token.token_name or token_address[:8]} crossed {milestone_value:.2f}x {direction}"
+                        )
+                        logger.info(
+                            f"   Current: {token.current_multiplier:.2f}x | Highest: {token.highest_multiplier:.2f}x | "
+                            f"Price: ${current_price:.10f}"
                         )
                     
                     token.has_crossed_threshold = True
                     tokens_crossing_threshold.append(token)
-                else:
-                    # Just log for monitoring
-                    logger.debug(f"👀 {token.token_name or token_address[:8]}: {token.current_multiplier:.4f}x")
             
             except Exception as e:
-                logger.error(f"Error processing {token.token_name or token_address[:8]}: {e}")
+                logger.error(f"Error processing {token.token_name or token_address[:8]}: {e}", exc_info=True)
     
     return tokens_crossing_threshold
 
 # --- Main Loop ---
 
 async def monitoring_loop():
-    """Main monitoring loop with single batch price fetch per tick"""
+    """Main monitoring loop"""
     logger.info("🔄 Starting monitoring loop...")
     
     while True:
@@ -561,39 +557,34 @@ async def monitoring_loop():
             new_tokens = scan_for_new_tokens()
             
             if new_tokens:
-                logger.info(f"📥 Found {len(new_tokens)} NEW token(s) to monitor: {[(addr[:8], row) for row, addr in new_tokens]}")
+                logger.info(f"📥 Found {len(new_tokens)} NEW token(s): {[(row, addr[:8]) for row, addr in new_tokens]}")
             
-            # Step 2: SINGLE BATCH PRICE FETCH FOR ALL TOKENS (including new ones)
-            # Pass new token addresses to the batch fetcher
+            # Step 2: Batch fetch prices
             new_addresses = [token_address for _, token_address in new_tokens]
             
-            # Fetch ALL prices in one batch
-            logger.info(f"👀 Tick #{app_state.tick_counter}: Fetching prices for {len(app_state.monitored_tokens) + len(new_addresses)} token(s) in batch...")
+            logger.info(f"👀 Tick #{app_state.tick_counter}: Fetching prices for {len(app_state.monitored_tokens) + len(new_addresses)} token(s)...")
             price_data = await get_all_token_prices_batch(additional_addresses=new_addresses)
             
             logger.debug(f"📊 Received price data for {len(price_data)} token(s)")
             
-            # Step 3: Initialize new tokens using fetched data
+            # Step 3: Initialize new tokens
             if new_tokens:
-                logger.info(f"🆕 Initializing {len(new_tokens)} new token(s)...")
                 for row_index, token_address in new_tokens:
                     if token_address in price_data:
-                        logger.info(f"   ➤ Token {token_address[:8]} found in price data")
                         await start_monitoring_token(row_index, token_address, price_data[token_address])
                     else:
-                        logger.error(f"   ✗ Token {token_address[:8]} NOT found in price data!")
+                        logger.error(f"   ✗ No price data for {token_address[:8]}")
             
-            # Step 4: Update ALL monitored tokens and check for threshold crossings
+            # Step 4: Update all tokens and check thresholds
             tokens_to_update = await update_all_tokens_and_check_thresholds(price_data)
             
-            # Step 5: BATCH UPDATE - Only tokens that crossed thresholds
+            # Step 5: Batch update sheet (threshold crossings only)
             if tokens_to_update:
                 logger.info(f"📝 {len(tokens_to_update)} token(s) crossed thresholds, updating sheet...")
                 batch_update_tokens(tokens_to_update)
             else:
                 logger.debug("✅ No threshold crossings this tick")
             
-            # Wait before next tick
             await asyncio.sleep(app_state.config.tick_interval_seconds)
         
         except Exception as e:
@@ -604,14 +595,15 @@ async def monitoring_loop():
 
 async def main_async():
     """Main async application"""
-    logger.info("🚀 Starting Solana Token Monitor (MODIFIED: Date header + Highest Multiplier)...")
+    logger.info("🚀 Starting Solana Token Monitor (FIXED VERSION)")
+    logger.info("✅ Column B (Token Address) is NEVER modified")
+    logger.info("✅ Accurate multiplier calculation with detailed logging")
     
     app_state.config = load_config()
     initialize_services()
     app_state.http_session = aiohttp.ClientSession()
     ensure_sheet_headers()
     
-    # Test DexScreener
     logger.info("🧪 Testing DexScreener API...")
     try:
         test_price_data = await get_all_token_prices_batch()
@@ -620,10 +612,6 @@ async def main_async():
         logger.warning(f"DexScreener test warning: {e}")
     
     logger.info(f"🔄 Starting main loop (tick: {app_state.config.tick_interval_seconds}s)...")
-    logger.info("📝 THRESHOLD-ONLY MODE: Sheet updates only on milestone crossings")
-    logger.info("🌐 BATCH MODE: All token prices fetched in single API call per tick")
-    logger.info("✅ MODIFIED: Column A has 'Date' header (populated by another script)")
-    logger.info("✅ MODIFIED: Tracking highest multiplier reached")
     
     try:
         await monitoring_loop()
